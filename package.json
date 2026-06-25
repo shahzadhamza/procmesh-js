@@ -1,5 +1,5 @@
 {
-  "name": "procmesh",
+  "name": "procmesh-js",
   "version": "0.1.0",
   "description": "Shared in-memory cache, pub/sub, RPC and locks across independent Node.js processes on one machine",
   "main": "src/index.js",
@@ -23,12 +23,12 @@
   "author": "Shahzad Hamza",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/shahzadhamza/procmesh.git"
+    "url": "git+https://github.com/shahzadhamza/procmesh-js.git"
   },
   "bugs": {
-    "url": "https://github.com/shahzadhamza/procmesh/issues"
+    "url": "https://github.com/shahzadhamza/procmesh-js/issues"
   },
-  "homepage": "https://github.com/shahzadhamza/procmesh#readme",
+  "homepage": "https://github.com/shahzadhamza/procmesh-js#readme",
   "engines": {
     "node": ">=18"
   },

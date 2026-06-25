@@ -19,7 +19,7 @@ cache, atomic ops, and locks are strongly consistent and correct by construction
 - 📦 **Zero infra** — no external server; only `lru-cache` required, no native deps
 
 ```bash
-npm install procmesh
+npm install procmesh-js
 ```
 
 ## Contents
@@ -39,7 +39,7 @@ npm install procmesh
 ## Quick start
 
 ```js
-const { createClient } = require('procmesh');
+const { createClient } = require('procmesh-js');
 
 // In process A
 const mesh = await createClient();           // auto-spawns a broker if needed
@@ -219,12 +219,12 @@ Run a **dedicated, supervised** broker (not auto-spawn) so it outlives your work
 ```ini
 # systemd: /etc/systemd/system/procmesh.service
 [Service]
-ExecStart=/usr/bin/node /path/to/node_modules/procmesh/src/broker-bin.js
+ExecStart=/usr/bin/node /path/to/node_modules/procmesh-js/src/broker-bin.js
 Environment=PROCMESH_BROKER_OPTS={"name":"default","idleTimeout":0,"persist":{"dir":"/var/lib/procmesh"}}
 Restart=always
 RestartSec=1
 ```
-(PM2: `pm2 start node_modules/procmesh/src/broker-bin.js`; Windows: wrap it with NSSM.)
+(PM2: `pm2 start node_modules/procmesh-js/src/broker-bin.js`; Windows: wrap it with NSSM.)
 
 ## Operations
 
