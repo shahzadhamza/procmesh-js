@@ -1,0 +1,46 @@
+{
+  "name": "procmesh",
+  "version": "0.1.0",
+  "description": "Shared in-memory cache, pub/sub, RPC and locks across independent Node.js processes on one machine",
+  "main": "src/index.js",
+  "bin": {
+    "procmesh": "src/cli.js"
+  },
+  "scripts": {
+    "test": "node --test test/",
+    "prepublishOnly": "npm test"
+  },
+  "keywords": [
+    "cache",
+    "ipc",
+    "shared-memory",
+    "pubsub",
+    "rpc",
+    "lock",
+    "multiprocess",
+    "in-memory"
+  ],
+  "author": "Shahzad Hamza",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/shahzadhamza/procmesh.git"
+  },
+  "bugs": {
+    "url": "https://github.com/shahzadhamza/procmesh/issues"
+  },
+  "homepage": "https://github.com/shahzadhamza/procmesh#readme",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "lru-cache": "^11.0.0"
+  },
+  "optionalDependencies": {
+    "msgpackr": "^1.11.0"
+  },
+  "files": [
+    "src",
+    "README.md"
+  ],
+  "license": "MIT"
+}
