@@ -3,6 +3,7 @@
 const net = require('net');
 const fs = require('fs');
 const EventEmitter = require('events');
+const { LRUCache } = require('lru-cache');
 const { Peer, TYPES, PROTOCOL_VERSION, matchTopic, isPattern } = require('./protocol');
 const { resolveCodec } = require('./codec');
 const { resolveAddress, isPipe } = require('./transport');
@@ -35,6 +36,10 @@ class Broker extends EventEmitter {
     // Global monotonic fencing-token counter. Seeded from persisted state (Phase 3) so tokens
     // stay strictly increasing across broker restarts — a stale pre-crash token can never pass.
     this.nextToken = opts.fenceSeed || 0;
+    // Global monotonic pub/sub offset counter. Every retained (persisted) message gets a strictly
+    // increasing offset so a reconnecting subscriber can resume from its last-seen one. Seeded from
+    // persisted state (block-reserved) so offsets stay increasing across restarts.
+    this.nextOffset = opts.offsetSeed || 0;
     this.locks = new LockManager({ mintToken: () => this._mintToken() });
     this.token = opts.token || null;
     // Fallback deadline for an RPC call whose caller didn't send its own timeout (older clients).
@@ -45,6 +50,48 @@ class Broker extends EventEmitter {
     // Crash-survival persistence (no-op unless opts.persist / PROCMESH_PERSIST_DIR is set).
     this.persist = createPersistence(opts.persist, this.name, this.codec);
     this.persist.onError = (err) => this.emit('persist-error', err);
+
+    // Idempotent-producer dedup: per (producerId, channel) highest accepted sequence, so a retried
+    // publish (same pid+seq) is delivered at most once. Bounded LRU + idle TTL keep memory in check;
+    // dedup.enabled:false turns it off entirely (pure at-most-once, zero dedup memory).
+    const dedupCfg = opts.dedup || {};
+    this.dedup =
+      dedupCfg.enabled === false
+        ? null
+        : new LRUCache({
+            max: dedupCfg.max || 100000,
+            ttl: dedupCfg.ttl == null ? 600000 : dedupCfg.ttl,
+            ttlAutopurge: false,
+            // Any read (including a dedup check) refreshes the entry's age, so an actively-publishing
+            // producer's window is never TTL-evicted out from under an in-flight retry.
+            updateAgeOnGet: true,
+          });
+    // Per-(producer,channel) dedup window: how far below the highwater a retried/out-of-order seq
+    // can still be recognized as a gap-fill (accept) vs a true duplicate (drop). Bounds per-entry
+    // memory to ~W seqs, so total dedup memory ≈ dedup.max × window.
+    this.dedupWindow = dedupCfg.window || 1024;
+    this.duplicates = 0; // count of deduped (retried) publishes
+    this.nextPid = 1; // producer-id counter (see _mintPid)
+
+    // Opt-in pub/sub persistence: append published messages to the AOF and keep a bounded
+    // per-channel retention ring for replay-on-subscribe. Orthogonal to `acks` (which governs
+    // fan-out reliability now); this governs crash-durability + replay. Off by default.
+    const pubsubCfg = opts.pubsub || {};
+    this.pubsubPersist = pubsubCfg.persist === true;
+    this.pubRetentionMax = pubsubCfg.retention == null ? 1000 : pubsubCfg.retention;
+    this.pubRetentionMs = pubsubCfg.retentionMs || 0;
+    // Which acks level must be fsync'd BEFORE acking: 'all' (default) | 1 | false (never sync).
+    this.durableAcks = pubsubCfg.durableAcks === undefined ? 'all' : pubsubCfg.durableAcks;
+    // channel -> [{ payload, seq, ts, offset }] (bounded). An LRU over channels caps the TOTAL
+    // number of retained channels (default 10000) so a producer using unbounded distinct channel
+    // names can't grow this without limit; the per-channel ring is separately capped in _retain.
+    this.pubRetention = new LRUCache({ max: pubsubCfg.maxChannels || 10000 });
+    if (this.pubsubPersist) {
+      // Recovered pub records aren't store state — route them to the retention ring, and re-append
+      // still-retained ones after an AOF rewrite so replay survives compaction.
+      this.persist.onPubRecord = (rec) => this._retain(rec.ch, rec.payload, rec.seq, rec.ts, rec.offset);
+      this.persist.onCompactPubReplay = () => this._retainedRecords();
+    }
 
     this.peerOpts = {
       sendHighWaterMark: opts.sendHighWaterMark,
@@ -82,6 +129,7 @@ class Broker extends EventEmitter {
     // half-loaded state. Seed the fencing counter past every token issued before the crash.
     await this.persist.load(this.store);
     this.nextToken = Math.max(this.nextToken, this.persist.loadedToken || 0);
+    this.nextOffset = Math.max(this.nextOffset, this.persist.loadedOffset || 0);
     await this._listen();
     this._startHeartbeat();
     this._startStats();
@@ -204,6 +252,53 @@ class Broker extends EventEmitter {
     return this.nextToken;
   }
 
+  /** Issue the next monotonic pub/sub offset. Single event loop ⇒ no locking needed. */
+  _mintOffset() {
+    this.nextOffset += 1;
+    if (this.persist) this.persist.noteOffset(this.nextOffset);
+    return this.nextOffset;
+  }
+
+  /** Get-or-create the sliding-window dedup entry for a `${pid} ${channel}` key (refreshes LRU). */
+  _dedupEntry(dkey) {
+    let e = this.dedup.get(dkey); // get() refreshes recency + age (updateAgeOnGet)
+    if (!e) {
+      e = { hi: 0, seen: new Set() };
+      this.dedup.set(dkey, e);
+    }
+    return e;
+  }
+
+  /**
+   * Sliding-window idempotency test. Mutates `e` to record acceptance and returns true iff `seq`
+   * is a TRUE duplicate (already accepted within the window). `e.hi` is the highest seq seen;
+   * `e.seen` holds accepted seqs in the window `(hi - W, hi]`.
+   *
+   *   - seq > hi              → new highest; accept, advance the window (prune stale seqs).
+   *   - hi - W < seq <= hi    → within window; a duplicate iff already in `seen`, else a gap-fill
+   *                             (a seq that never actually landed) → accept.
+   *   - seq <= hi - W         → older than the window; assume already delivered → duplicate.
+   *
+   * This is the fix for the old `seq <= last` check, which mistook a never-delivered gap seq for a
+   * duplicate and silently dropped it.
+   */
+  _dedupSeen(e, seq) {
+    const W = this.dedupWindow;
+    if (seq > e.hi) {
+      e.hi = seq;
+      e.seen.add(seq);
+      const floor = e.hi - W;
+      for (const s of e.seen) if (s <= floor) e.seen.delete(s);
+      return false;
+    }
+    if (seq > e.hi - W) {
+      if (e.seen.has(seq)) return true; // true duplicate within the window
+      e.seen.add(seq); // gap-fill: never actually delivered → accept
+      return false;
+    }
+    return true; // older than the window → assume already delivered
+  }
+
   /**
    * Gate a fenced mutation: reject (EFENCED) if the presented token is older than the highest
    * ever issued for the governing lock key — i.e. the caller's lock was superseded. Throws so
@@ -248,7 +343,10 @@ class Broker extends EventEmitter {
           }
           conn.authed = true;
           conn.name = msg.name || null;
-          conn.peer.send({ t: TYPES.WELCOME, id, version: PROTOCOL_VERSION, broker: this.name });
+          // Producer id for idempotent publishing: reuse the one the client presents (so dedup
+          // survives a reconnect), else mint a fresh broker-unique one and hand it back.
+          conn.pid = msg.pid || this._mintPid();
+          conn.peer.send({ t: TYPES.WELCOME, id, version: PROTOCOL_VERSION, broker: this.name, pid: conn.pid });
           break;
         case TYPES.PING:
           conn.peer.send({ t: TYPES.PONG, id });
@@ -346,16 +444,50 @@ class Broker extends EventEmitter {
 
         // ---- pub/sub ----
         case TYPES.SUBSCRIBE:
+          // Register FIRST, then replay — both synchronously with no await between them, so on this
+          // single event loop no live PUBLISH can interleave. Replay thus covers up to the current
+          // offset high-water; any later live message has a strictly higher offset (no overlap).
           this._subscribe(conn, msg.channel);
-          this._ok(conn, id, true);
+          if (typeof msg.since === 'number') {
+            // Reconnect catch-up: everything published after the consumer's last-seen offset.
+            this._replayTo(conn, msg.channel, { since: msg.since });
+          } else if (msg.replay) {
+            // Opt-in replay: `replay:true` = all retained matches; `replay:<N>` = most recent N.
+            this._replayTo(conn, msg.channel, msg.replay === true ? { all: true } : { limit: msg.replay });
+          }
+          // Reply carries the current offset high-water so a consumer that receives no messages still
+          // has a baseline to resume from after a disconnect. (Older clients ignore the object.)
+          this._ok(conn, id, { ok: true, offset: this.nextOffset });
           break;
         case TYPES.UNSUBSCRIBE:
           this._unsubscribe(conn, msg.channel);
           this._ok(conn, id, true);
           break;
-        case TYPES.PUBLISH:
-          this._ok(conn, id, this._publish(msg.channel, msg.payload));
+        case TYPES.PUBLISH: {
+          const acks = msg.acks == null ? 1 : msg.acks;
+          const reply = acks !== 0; // acks:0 is fire-and-forget — the client isn't waiting
+          // Idempotency: drop a retried publish (same producer id + channel + a seq we've already
+          // accepted) so it's delivered at most once, then still ack so the producer's retry settles.
+          // A genuine gap (a lower seq that never landed) is NOT a duplicate — see _dedupSeen.
+          if (this.dedup && msg.pid != null && msg.seq != null) {
+            const dkey = `${msg.pid} ${msg.channel}`;
+            const e = this._dedupEntry(dkey);
+            if (this._dedupSeen(e, msg.seq)) {
+              this.duplicates += 1;
+              // Resolve `null` (not 0) so the producer can tell a deduped retry from a real
+              // fan-out that reached zero subscribers.
+              if (reply) this._ok(conn, id, null);
+              break;
+            }
+          }
+          // Mint the offset (if retaining) BEFORE fan-out so the live frame and the retained copy
+          // share the same offset — a live subscriber and a later replay agree on ordering.
+          const offset = this.pubsubPersist ? this._persistPublish(msg, acks) : undefined;
+          // acks:'all' → reliable (non-droppable) fan-out; acks:0/1 → best-effort (droppable).
+          const delivered = this._publish(msg.channel, msg.payload, { reliable: acks === 'all', offset });
+          if (reply) this._ok(conn, id, delivered);
           break;
+        }
 
         // ---- rpc ----
         case TYPES.REGISTER:
@@ -404,7 +536,12 @@ class Broker extends EventEmitter {
     }
   }
 
-  _publish(channel, payload) {
+  _publish(channel, payload, opts = {}) {
+    const reliable = opts.reliable === true;
+    // A retained message carries a monotonic `offset` so subscribers can resume from it after a
+    // reconnect. Undefined for non-persisted publishes (field omitted from the frame).
+    const offset = opts.offset;
+    const frame = offset === undefined ? { t: TYPES.MESSAGE, channel, payload } : { t: TYPES.MESSAGE, channel, payload, offset };
     // Collect target conns: exact subscribers + any matching wildcard patterns.
     // Dedupe so a conn subscribed both exactly and by pattern gets one copy.
     const targets = new Set(this.channels.get(channel) || []);
@@ -419,15 +556,109 @@ class Broker extends EventEmitter {
     for (const cid of targets) {
       const c = this.conns.get(cid);
       if (!c) continue;
-      const r = c.peer.send({ t: TYPES.MESSAGE, channel, payload }, { droppable: true });
+      // acks:'all' uses the non-droppable path — a slow consumer is backpressured (buffered up to
+      // the hard limit, then disconnected as 'overflow') rather than silently dropped.
+      const r = c.peer.send(frame, { droppable: !reliable });
       if (r === 'dropped') {
         this.dropped++;
         this.emit('drop', { channel, connId: cid });
+      } else if (r === 'overflow') {
+        // Slow consumer hit the hard limit and was disconnected by send() — not delivered.
       } else {
         delivered++;
       }
     }
     return delivered;
+  }
+
+  /** Mint a broker-unique producer id. Includes startedAt so ids don't collide across restarts. */
+  _mintPid() {
+    return `p${this.startedAt}_${this.nextPid++}`;
+  }
+
+  // ------------------------------------------------------------- pub/sub persistence & retention
+
+  /**
+   * Persist a published message (durable-before-ack for the configured level), retain it, and
+   * return its monotonic offset so the live fan-out frame can carry it.
+   */
+  _persistPublish(msg, acks) {
+    const ts = Date.now();
+    const offset = this._mintOffset();
+    const rec = { op: 'pub', ch: msg.channel, payload: msg.payload, seq: msg.seq, ts, offset };
+    if (this.persist.enabled) {
+      const rank = (a) => (a === 'all' ? 2 : a === 0 ? 0 : 1);
+      const durable = this.durableAcks !== false && rank(acks) >= rank(this.durableAcks);
+      if (durable) this.persist.logPublishSync(rec);
+      else this.persist.logMutation(rec);
+    }
+    this._retain(msg.channel, msg.payload, msg.seq, ts, offset);
+    return offset;
+  }
+
+  /** Append a message to a channel's bounded retention ring (for replay-on-subscribe). */
+  _retain(channel, payload, seq, ts = Date.now(), offset) {
+    // retention:0 means "retain nothing" (replay disabled), not "unbounded" — a ring capped at 0
+    // would otherwise grow without bound. `retention` defaults to 1000 when unset (see constructor).
+    if (this.pubRetentionMax === 0) return;
+    let ring = this.pubRetention.get(channel);
+    if (!ring) {
+      ring = [];
+      this.pubRetention.set(channel, ring);
+    }
+    ring.push({ payload, seq, ts, offset });
+    if (this.pubRetentionMax > 0 && ring.length > this.pubRetentionMax) {
+      ring.splice(0, ring.length - this.pubRetentionMax);
+    }
+    if (this.pubRetentionMs > 0) {
+      const cutoff = Date.now() - this.pubRetentionMs;
+      while (ring.length && ring[0].ts < cutoff) ring.shift();
+    }
+    if (ring.length === 0) this.pubRetention.delete(channel);
+  }
+
+  /** Flatten the retention rings back into pub records (used to survive an AOF rewrite). */
+  _retainedRecords() {
+    const out = [];
+    for (const [ch, ring] of this.pubRetention) {
+      for (const m of ring) out.push({ op: 'pub', ch, payload: m.payload, seq: m.seq, ts: m.ts, offset: m.offset });
+    }
+    return out;
+  }
+
+  /**
+   * Replay retained messages matching `channel` to a just-subscribed conn. `opts`:
+   *   - { since: N }  → every retained message with offset > N (reconnect catch-up).
+   *   - { limit: N }  → the most recent N retained messages (explicit `replay: N`).
+   *   - { all: true } → all retained matches (`replay: true`).
+   * Replay is NON-droppable: durably retained messages must not be silently dropped under
+   * backpressure. If a slow consumer overflows mid-replay its socket is destroyed, so we stop —
+   * it will reconnect and resume from its last offset.
+   */
+  _replayTo(conn, channel, opts = {}) {
+    if (this.pubRetention.size === 0) return;
+    // Gather matching (channel, message) pairs. Exact channels hit one ring; a wildcard pattern
+    // scans retained channels for prefix matches. (for..of over the LRU doesn't bump recency.)
+    const matches = [];
+    for (const [ch, ring] of this.pubRetention) {
+      if (!matchTopic(channel, ch)) continue;
+      for (const m of ring) matches.push({ ch, m });
+    }
+    if (matches.length === 0) return;
+    // Canonical order is by offset (monotonic); fall back to ts for any pre-offset recovered record.
+    matches.sort((a, b) => (a.m.offset || 0) - (b.m.offset || 0) || a.m.ts - b.m.ts);
+    let selected;
+    if (typeof opts.since === 'number') {
+      selected = matches.filter(({ m }) => (m.offset || 0) > opts.since);
+    } else if (typeof opts.limit === 'number' && opts.limit > 0) {
+      selected = matches.slice(Math.max(0, matches.length - opts.limit));
+    } else {
+      selected = matches;
+    }
+    for (const { ch, m } of selected) {
+      const frame = m.offset === undefined ? { t: TYPES.MESSAGE, channel: ch, payload: m.payload } : { t: TYPES.MESSAGE, channel: ch, payload: m.payload, offset: m.offset };
+      if (conn.peer.send(frame, { droppable: false }) === 'overflow') return;
+    }
   }
 
   // ----------------------------------------------------------------------- rpc
@@ -617,6 +848,8 @@ class Broker extends EventEmitter {
       cacheSize: this.store.size,
       ops: { ...this.stats.ops },
       dropped: this.dropped,
+      duplicates: this.duplicates,
+      dedupSize: this.dedup ? this.dedup.size : 0,
       reaped: this.stats.reaped,
       locks: lockStats.locks,
       lockWaiters: lockStats.waiters,

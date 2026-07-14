@@ -84,9 +84,91 @@ await off();                                // unsubscribe
 // Wildcard (prefix) subscriptions — a trailing * matches by prefix:
 await mesh.subscribe('orders.*', (p, channel) => { /* orders.created, orders.shipped, ... */ });
 ```
-A slow subscriber can't make the broker run out of memory: pub/sub frames to a
+A slow subscriber can't make the broker run out of memory: by default pub/sub frames to a
 backed-up consumer are dropped past the high-water mark (see `sendHighWaterMark`),
 while replies/RPC stay reliable.
+
+#### Producer `acks` — choose your delivery guarantee
+
+procmesh is a **single broker per channel** (sharding partitions, it doesn't replicate), so the
+Kafka `acks` ladder maps to what one broker can promise:
+
+| `acks`   | Waits for                                                                     | Reliability | Speed   |
+| -------- | ---------------------------------------------------------------------------- | ----------- | ------- |
+| `0`      | nothing — writes the frame and returns immediately (`undefined`)             | Low         | Fastest |
+| `1` *(default)* | the broker to receive + fan out best-effort (slow subs may be **dropped**) | Medium | Fast    |
+| `'all'`  | **reliable, no-drop** fan-out — slow subs are backpressured, `delivered === subscriberCount` | Highest | Slowest |
+
+```js
+await mesh.publish('orders', msg);                 // acks:1 (default)
+await mesh.publish('metrics', msg, { acks: 0 });   // fire-and-forget, fastest
+await mesh.publish('orders', msg, { acks: 'all' }); // no message dropped to a slow consumer
+```
+
+`publish` resolves with the **delivered count** — the number of subscribers the message was
+*queued to* (written to the socket send buffer; not dropped/overflowed). That is a fan-out count,
+**not** an end-to-end consumer acknowledgement: `acks:'all'` guarantees the frame was enqueued to
+every live subscriber (slow ones are disconnected, not silently dropped), not that each consumer
+processed it. A deduped retry resolves `null` (distinct from `0` = delivered to zero subscribers);
+`acks:0` resolves `undefined`.
+
+#### Idempotent producer — safe retries, no duplicates
+
+Turn on `idempotent` and each publish carries a producer id + per-channel sequence. The broker
+dedupes retries, so a publish that times out is retried automatically (for `acks>=1`) with the
+*same* sequence and is delivered **at most once**:
+
+```js
+await mesh.publish('orders', msg, { acks: 'all', idempotent: true });
+
+// Or bind defaults with a Kafka-style producer handle:
+const producer = mesh.producer({ acks: 'all', idempotent: true });
+await producer.publish('orders', msg);
+```
+
+Dedup is a **sliding window** (`dedup.window`, default 1024): a retried or out-of-order sequence is
+dropped only if that exact seq was already accepted, so a genuine gap — a lower seq that never
+landed while a higher one did — is still delivered rather than mistaken for a duplicate. Retries on a
+dropped link **wait for reconnection** (bounded by the publish `timeout`) instead of burning the
+retry budget while offline.
+
+The broker-minted producer id survives client reconnects, so dedup holds across a dropped link. To
+keep dedup working across a full **process restart**, pass a stable `pubsub.producerId` and seed the
+per-channel sequence you last used (persist it yourself), so the restarted producer resumes above the
+broker's high-water:
+
+```js
+const mesh = await createClient({
+  pubsub: { idempotent: true, producerId: 'ingest-1', sequences: { orders: lastSeqYouPersisted } },
+});
+// mesh.sequence('orders') / mesh.setSequence('orders', n) read/seed the counter to persist.
+```
+
+(Dedup state is in-memory on the broker and bounded — see the `dedup` broker options — so
+cross-restart dedup holds only while the broker stays up and within the window/TTL.)
+
+#### Persistence & replay (opt-in)
+
+By default pub/sub is in-memory and at-most-once. Turn on **`pubsub.persist`** broker-side to append
+published messages to the log and keep a bounded per-channel retention ring. A subscriber can then
+**replay** the recent backlog — and with a persist dir, messages survive a broker restart:
+
+```js
+// broker (auto-spawn via createClient, explicit createBroker, or `procmesh serve --pubsub-persist`)
+createBroker({ persist: { dir: '/var/lib/procmesh' }, pubsub: { persist: true, retention: 1000 } });
+
+// consumer opts in to replay
+await mesh.subscribe('orders', handler, { replay: true });  // all retained; or { replay: 100 } for last N
+```
+With `acks:'all'` and persistence on, the broker fsyncs the message **before** acking (durable ack).
+
+Each retained message gets a monotonic **offset**, and each subscriber tracks the highest offset it
+has seen. On reconnect the client resumes from that offset, so messages published while it was
+disconnected are **caught up** (delivered exactly once) rather than lost — this makes a reconnecting
+subscriber effectively at-least-once for anything still in the retention window. Retention is bounded
+(`pubsub.retention` per channel, `pubsub.maxChannels` total channels), so a message evicted before a
+slow consumer resumes is a gap in that best-effort window — this is a bounded replay buffer, not an
+infinite Kafka-style log.
 
 ### RPC (request/response across processes)
 ```js
@@ -243,9 +325,9 @@ npx procmesh stop             # ask it to shut down
 ### Observability
 
 ```js
-const s = await mesh.stats();   // { uptimeMs, connections, cacheSize, ops, dropped, reaped,
-                                //   locks, lockWaiters, pendingCalls, subscriptions, procs,
-                                //   memory, cpuCoreFraction }
+const s = await mesh.stats();   // { uptimeMs, connections, cacheSize, ops, dropped, duplicates,
+                                //   dedupSize, reaped, locks, lockWaiters, pendingCalls,
+                                //   subscriptions, procs, memory, cpuCoreFraction }
 ```
 Or from the shell: `npx procmesh stats [--json]`. Counters are bumped on the hot path with a
 single integer increment per op, so this is cheap to poll for a Prometheus exporter, etc.
@@ -274,8 +356,19 @@ await createClient({
   token: undefined,       // shared secret; if the broker requires one, must match (else EAUTH)
   cache: { max: 10_000, ttl: 0, maxSize: 0 },     // broker cache bounds (used when this client spawns the broker)
   shards: undefined,      // scale past one core: a count N, or an array of broker addresses/names (see Sharding)
+  pubsub: {               // producer defaults for publish() (per-call opts override); also carries the
+                          //   broker persist knobs below, forwarded to an auto-spawned broker
+    acks: 1,              //   default acks level: 0 | 1 | 'all'
+    idempotent: false,    //   attach pid+seq so retries dedupe
+    producerId: undefined,//   stable producer id (survives a process restart; else broker-minted)
+    sequences: undefined, //   { channel: lastSeq } to seed per-channel seqs across a restart
+    retries: 3,           //   publish auto-retries (idempotent + acks>=1 only)
+    retryBackoff: 50,     //   base ms, exponential with jitter
+    retryMaxDelay: 2000,  //   ceiling per retry (ms)
+  },
 });
 ```
+Per-call overrides win over the client defaults: `publish(ch, msg, { acks: 'all', idempotent: true, timeout, retries })`.
 
 Broker-side options (passed to `createBroker`, `procmesh serve`, or forwarded by an
 auto-spawning client):
@@ -292,8 +385,24 @@ createBroker({
   statsInterval: 0,            // ms; if set, emit a 'stats' snapshot on this interval (0 = off)
   cache: { max: 10_000, ttl: 0, maxSize: 0 },
   persist: undefined,          // crash-survival persistence — see below (off by default)
+  dedup: {                     // idempotent-producer dedup store (bounds retry-dedup memory)
+    enabled: true,             //   false = ignore pid/seq entirely (pure at-most-once, zero memory)
+    max: 100_000,              //   max (producerId, channel) entries
+    ttl: 600_000,              //   ms idle before a producer's dedup state ages out
+    window: 1024,              //   per-entry sliding window: how far below the highwater a retried/
+                               //   out-of-order seq can still be recognized (gap-fill vs duplicate)
+  },
+  pubsub: {                    // opt-in pub/sub message persistence (orthogonal to acks)
+    persist: false,            //   append published messages to the AOF + keep a retention ring
+    retention: 1000,           //   retained messages per channel for replay (count)
+    retentionMs: 0,            //   OR age-based retention in ms (0 = count-only)
+    maxChannels: 10_000,       //   cap on the number of retained channels (LRU-evicted; DoS guard)
+    durableAcks: 'all',        //   which acks level fsyncs BEFORE acking: 'all' | 1 | false
+  },
 });
 ```
+CLI equivalents on `procmesh serve`: `--dedup-max`, `--dedup-ttl`, `--no-dedup`, `--pubsub-persist`,
+`--pubsub-retention`.
 
 ## How it works
 
@@ -321,8 +430,10 @@ node app-a   node app-b   node worker
   ops/sec). To scale past it, **shard** across N brokers with `createClient({ shards: N })` — see
   [Sharding](#sharding-scale-past-one-core).
 - **Persistence is opt-in** (see above). Without it, state is gone when the broker exits. Even
-  with it, locks are released on restart (they're connection-scoped), and pub/sub is at-most-once
-  (messages published during a disconnect are not buffered).
+  with it, locks are released on restart (they're connection-scoped). Pub/sub is at-most-once by
+  default (messages published during a disconnect aren't buffered); for stronger guarantees use
+  `acks:'all'` (no-drop fan-out), `idempotent` (dedup'd retries), and `pubsub.persist` (durable
+  publish + bounded replay-on-subscribe) — see [Pub/Sub](#pubsub).
 - Every cache op is a local IPC round-trip (~0.05–0.2 ms). Fine for coordination;
   not a substitute for a per-process hot cache in ultra-hot paths.
 

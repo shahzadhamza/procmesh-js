@@ -2,7 +2,7 @@
 
 const EventEmitter = require('events');
 
-const PROTOCOL_VERSION = 2;
+const PROTOCOL_VERSION = 4;
 
 /** Message type tags. Kept short to minimize JSON overhead. */
 const TYPES = {

@@ -23,6 +23,7 @@ const { encodeFrame, FrameDecoder } = require('./protocol');
 
 const SNAPSHOT_VERSION = 1;
 const TOKEN_BLOCK = 1024; // reserve fencing tokens in blocks; ~1 AOF record per 1024 grants
+const OFFSET_BLOCK = 1024; // reserve pub/sub offsets in blocks; keeps offsets monotonic across restart
 const DEFAULT_AOF_REWRITE_OPS = 100000; // compact (snapshot + truncate) after this many appends
 
 /** No-op persistence used when the feature is disabled (zero-config default). */
@@ -30,6 +31,7 @@ class NullPersistence {
   constructor() {
     this.enabled = false;
     this.loadedToken = 0;
+    this.loadedOffset = 0;
   }
 
   // eslint-disable-next-line class-methods-use-this
@@ -39,7 +41,13 @@ class NullPersistence {
   logMutation() {}
 
   // eslint-disable-next-line class-methods-use-this
+  logPublishSync() {}
+
+  // eslint-disable-next-line class-methods-use-this
   noteToken() {}
+
+  // eslint-disable-next-line class-methods-use-this
+  noteOffset() {}
 
   // eslint-disable-next-line class-methods-use-this
   start() {}
@@ -69,7 +77,15 @@ class Persistence {
 
     this.loadedToken = 0; // highest reserved token recovered on load
     this.tokenReserved = 0; // current reserved ceiling
+    this.loadedOffset = 0; // highest reserved pub/sub offset recovered on load
+    this.offsetReserved = 0; // current reserved offset ceiling
     this._store = null; // set in load(), used for compaction snapshots
+
+    // Pub/sub persistence hooks, wired by the broker. Pub records are NOT store state, so on
+    // recovery they're routed to the broker's retention ring instead of the cache store, and on
+    // compaction the still-retained ones are re-appended so replay survives an AOF rewrite.
+    this.onPubRecord = null; // (rec) => void — called for each recovered { op:'pub', ... }
+    this.onCompactPubReplay = null; // () => rec[] — records to re-append after truncation
 
     this._fsyncTimer = null;
     this._snapshotTimer = null;
@@ -90,6 +106,7 @@ class Persistence {
         if (snap && snap.version === SNAPSHOT_VERSION) {
           store.load(snap.entries || []);
           this.loadedToken = Math.max(this.loadedToken, snap.fenceToken || 0);
+          this.loadedOffset = Math.max(this.loadedOffset, snap.offset || 0);
         }
       } catch {
         // Corrupt/foreign snapshot — recover from the AOF alone rather than refuse to start.
@@ -110,6 +127,7 @@ class Persistence {
 
     // 3. Compact: fold what we just recovered into a fresh snapshot, then start a clean AOF.
     this.tokenReserved = this.loadedToken;
+    this.offsetReserved = this.loadedOffset;
     this._writeSnapshot(store);
     this.fd = fs.openSync(this.aofPath, 'a');
   }
@@ -128,6 +146,13 @@ class Persistence {
       case 'token':
         this.loadedToken = Math.max(this.loadedToken, rec.n || 0);
         break;
+      case 'offset':
+        this.loadedOffset = Math.max(this.loadedOffset, rec.n || 0);
+        break;
+      case 'pub':
+        // Not store state — hand to the broker's retention ring (bounded there).
+        if (this.onPubRecord) this.onPubRecord(rec);
+        break;
       default:
         break;
     }
@@ -142,11 +167,41 @@ class Persistence {
     if (this.opsSinceSnapshot >= this.aofRewriteOps && this._store) this._compact();
   }
 
+  /**
+   * Durably append a record and fsync BEFORE returning, regardless of the configured fsync mode.
+   * Used for `acks:'all'` publishes when pub/sub persistence is on, so a broker crash right after
+   * the producer's ack can't lose the message. The AOF is opened in append mode, so each write is
+   * atomic even if async cache writes are also draining — ordering across records doesn't matter
+   * because every record is a self-contained absolute effect.
+   */
+  logPublishSync(rec) {
+    if (this._closed || this.fd == null) return;
+    const frame = encodeFrame(this.codec, rec);
+    try {
+      fs.writeSync(this.fd, frame);
+      fs.fsyncSync(this.fd);
+      this.dirty = false;
+    } catch (err) {
+      this._onWriteError(err);
+      return;
+    }
+    this.opsSinceSnapshot += 1;
+    if (this.opsSinceSnapshot >= this.aofRewriteOps && this._store) this._compact();
+  }
+
   /** Called by the broker on every fencing-token mint; reserves a block when crossed. */
   noteToken(n) {
     if (n > this.tokenReserved) {
       this.tokenReserved = Math.ceil((n + 1) / TOKEN_BLOCK) * TOKEN_BLOCK;
       this._append({ op: 'token', n: this.tokenReserved });
+    }
+  }
+
+  /** Called by the broker on every pub/sub offset mint; reserves a block when crossed. */
+  noteOffset(n) {
+    if (n > this.offsetReserved) {
+      this.offsetReserved = Math.ceil((n + 1) / OFFSET_BLOCK) * OFFSET_BLOCK;
+      this._append({ op: 'offset', n: this.offsetReserved });
     }
   }
 
@@ -198,6 +253,7 @@ class Persistence {
       version: SNAPSHOT_VERSION,
       createdAt: Date.now(),
       fenceToken: this.tokenReserved,
+      offset: this.offsetReserved,
       entries: store.dump(),
     });
     const tmp = `${this.snapshotPath}.tmp`;
@@ -221,6 +277,11 @@ class Persistence {
     this.fd = fs.openSync(this.aofPath, 'w'); // 'w' truncates
     fs.closeSync(this.fd);
     this.fd = fs.openSync(this.aofPath, 'a');
+    // Pub records aren't in the snapshot; re-append the ones still within the broker's retention
+    // window so replay-on-subscribe survives an AOF rewrite. Bounded by the retention ring size.
+    if (this.onCompactPubReplay) {
+      for (const rec of this.onCompactPubReplay()) this._append(rec);
+    }
   }
 
   // ------------------------------------------------------------------- lifecycle

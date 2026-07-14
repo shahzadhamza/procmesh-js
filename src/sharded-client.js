@@ -185,9 +185,9 @@ class ShardedClient extends EventEmitter {
    * on EVERY shard (a publish can land on any of them). The returned off() mirrors the
    * subscription's footprint.
    */
-  async subscribe(channel, handler) {
-    if (!isPattern(channel)) return this._clientForChannel(channel).subscribe(channel, handler);
-    const offs = await this._fanOut((c) => c.subscribe(channel, handler));
+  async subscribe(channel, handler, opts = {}) {
+    if (!isPattern(channel)) return this._clientForChannel(channel).subscribe(channel, handler, opts);
+    const offs = await this._fanOut((c) => c.subscribe(channel, handler, opts));
     return async () => {
       await Promise.all(offs.map((off) => off()));
     };
@@ -204,8 +204,15 @@ class ShardedClient extends EventEmitter {
    * subscriber is reachable there — and a message can never be delivered twice. The returned
    * `delivered` count is that broker's matching-subscriber count (which is all of them).
    */
-  publish(channel, payload) {
-    return this._clientForChannel(channel).publish(channel, payload);
+  publish(channel, payload, opts = {}) {
+    return this._clientForChannel(channel).publish(channel, payload, opts);
+  }
+
+  /** Kafka-style producer handle that routes each publish to the channel's owning shard. */
+  producer(defaults = {}) {
+    return {
+      publish: (channel, payload, opts = {}) => this.publish(channel, payload, { ...defaults, ...opts }),
+    };
   }
 
   // ------------------------------------------------------------------------ rpc
@@ -317,6 +324,8 @@ function aggregateStats(per) {
     cacheSize: sum('cacheSize'),
     ops,
     dropped: sum('dropped'),
+    duplicates: sum('duplicates'),
+    dedupSize: sum('dedupSize'),
     reaped: sum('reaped'),
     locks: sum('locks'),
     lockWaiters: sum('lockWaiters'),

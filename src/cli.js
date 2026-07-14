@@ -15,6 +15,11 @@ function parseArgs(argv) {
     else if (a === '--json') out.json = true;
     else if (a === '--persist-dir') out.persistDir = argv[++i];
     else if (a === '--no-persist') out.noPersist = true;
+    else if (a === '--dedup-max') out.dedupMax = Number(argv[++i]);
+    else if (a === '--dedup-ttl') out.dedupTtl = Number(argv[++i]);
+    else if (a === '--no-dedup') out.noDedup = true;
+    else if (a === '--pubsub-persist') out.pubsubPersist = true;
+    else if (a === '--pubsub-retention') out.pubsubRetention = Number(argv[++i]);
   }
   return out;
 }
@@ -38,6 +43,13 @@ Usage:
   procmesh status    check if a broker is up
   procmesh stats     print broker metrics ([--json])
   procmesh stop      ask the broker to shut down
+
+serve pub/sub options:
+  --dedup-max <n>        idempotency dedup cache size (default 100000)
+  --dedup-ttl <ms>       idle TTL before a producer's dedup state ages out (default 600000)
+  --no-dedup             disable idempotency dedup entirely
+  --pubsub-persist       persist published messages (durable acks + replay-on-subscribe)
+  --pubsub-retention <n> retained messages per channel for replay (default 1000)
 `);
 }
 
@@ -50,7 +62,21 @@ async function main() {
       // Persistence: on by default for a long-lived `serve` broker (it's the production entry
       // point); disable with --no-persist. Dir from --persist-dir or PROCMESH_PERSIST_DIR.
       const persist = args.noPersist ? { mode: 'off' } : { dir: args.persistDir };
-      const broker = new Broker({ name: args.name, address: args.socket, token: args.token, idleTimeout: 0, persist });
+      const dedup = args.noDedup
+        ? { enabled: false }
+        : { max: args.dedupMax == null ? undefined : args.dedupMax, ttl: args.dedupTtl == null ? undefined : args.dedupTtl };
+      // Use == null (not ||) so a legitimate 0 survives: --pubsub-retention 0 means "persist but
+      // retain nothing / disable replay", which `|| undefined` would silently turn into the default.
+      const pubsub = { persist: !!args.pubsubPersist, retention: args.pubsubRetention == null ? undefined : args.pubsubRetention };
+      const broker = new Broker({
+        name: args.name,
+        address: args.socket,
+        token: args.token,
+        idleTimeout: 0,
+        persist,
+        dedup,
+        pubsub,
+      });
       await broker.start();
       // eslint-disable-next-line no-console
       console.log(`procmesh broker listening on ${broker.address}`);
@@ -107,7 +133,7 @@ async function main() {
             `broker UP at ${client.address}\n` +
               `  uptime ${Math.round(s.uptimeMs / 1000)}s | conns ${s.connections} | cache ${s.cacheSize} keys\n` +
               `  locks ${s.locks} (waiters ${s.lockWaiters}) | pending calls ${s.pendingCalls} | subs ${s.subscriptions}\n` +
-              `  dropped ${s.dropped} | reaped ${s.reaped} | cpu ${(s.cpuCoreFraction * 100).toFixed(1)}% of a core\n` +
+              `  dropped ${s.dropped} | duplicates ${s.duplicates || 0} | reaped ${s.reaped} | cpu ${(s.cpuCoreFraction * 100).toFixed(1)}% of a core\n` +
               `  rss ${Math.round(s.memory.rss / 1048576)}MB | heap ${Math.round(s.memory.heapUsed / 1048576)}MB`
           );
         }
