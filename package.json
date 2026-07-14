@@ -1,6 +1,6 @@
 {
   "name": "procmesh-js",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Shared in-memory cache, pub/sub, RPC and locks across independent Node.js processes on one machine",
   "main": "src/index.js",
   "bin": {
