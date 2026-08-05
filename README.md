@@ -91,7 +91,7 @@ while replies/RPC stay reliable.
 #### Producer `acks` — choose your delivery guarantee
 
 procmesh is a **single broker per channel** (sharding partitions, it doesn't replicate), so the
-Kafka `acks` ladder maps to what one broker can promise:
+`acks` levels map to what one broker can promise:
 
 | `acks`   | Waits for                                                                     | Reliability | Speed   |
 | -------- | ---------------------------------------------------------------------------- | ----------- | ------- |
@@ -121,7 +121,7 @@ dedupes retries, so a publish that times out is retried automatically (for `acks
 ```js
 await mesh.publish('orders', msg, { acks: 'all', idempotent: true });
 
-// Or bind defaults with a Kafka-style producer handle:
+// Or bind defaults with a producer handle:
 const producer = mesh.producer({ acks: 'all', idempotent: true });
 await producer.publish('orders', msg);
 ```
@@ -171,7 +171,7 @@ subscriber effectively at-least-once for anything still in the retention window.
 and across log compactions — until you bound it (`pubsub.retention` messages per channel,
 `pubsub.retentionMs` by age, `pubsub.maxChannels` total channels). Bound it for long-running brokers;
 once bounded, a message evicted before a slow consumer resumes is a gap in that best-effort window —
-a replay buffer, not an infinite Kafka-style log.
+a replay buffer, not an infinite log.
 
 ### RPC (request/response across processes)
 ```js
