@@ -23,7 +23,7 @@ function isSharded(opts) {
  * @param {string|object} [opts.codec]     'json' (default) | 'msgpack' | custom
  * @param {boolean} [opts.autoSpawn=true]  spawn a broker if none is running
  * @param {boolean} [opts.reconnect=true]  auto-reconnect on connection loss
- * @param {object} [opts.cache]            broker cache config { max, ttl, maxSize }
+ * @param {object} [opts.cache]            broker cache config { max, ttl, maxSize } — unbounded unless at least one is set
  * @param {number|Array<string|object>} [opts.shards]  shard across N brokers: a count N
  *        (auto-spawns brokers named `${name}#0..#N-1`) or an array of names/{name,address} specs
  */

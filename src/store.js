@@ -17,24 +17,107 @@ function approxSize(value) {
 }
 
 /**
+ * Map-backed stand-in for LRUCache used when the user configures NO bounds
+ * (no max/maxSize/ttl): unbounded storage with per-item TTL support and lazy
+ * expiry (an expired entry is purged when touched or iterated — no timers).
+ * Implements only the LRUCache surface Store uses.
+ */
+class UnboundedTtlMap {
+  constructor() {
+    this.map = new Map(); // key -> { v, exp }  exp: 0 = no expiry, else absolute ms epoch
+  }
+
+  /** Live entry or undefined; purges an expired entry on touch. */
+  _live(key) {
+    const e = this.map.get(key);
+    if (!e) return undefined;
+    if (e.exp !== 0 && e.exp <= Date.now()) {
+      this.map.delete(key);
+      return undefined;
+    }
+    return e;
+  }
+
+  get(key) {
+    const e = this._live(key);
+    return e ? e.v : undefined;
+  }
+
+  peek(key) {
+    return this.get(key); // no recency to preserve in a Map
+  }
+
+  has(key) {
+    return this._live(key) !== undefined;
+  }
+
+  set(key, value, opts) {
+    const { ttl, noUpdateTTL } = opts || {};
+    const cur = this._live(key); // purges if expired, so expired counts as a new insert
+    // Mirrors lru-cache: noUpdateTTL preserves a LIVE entry's clock; a new insert takes
+    // the provided ttl (or none). A plain set on a live entry clears any per-item TTL.
+    const exp = cur && noUpdateTTL ? cur.exp : ttl && ttl > 0 ? Date.now() + ttl : 0;
+    this.map.set(key, { v: value, exp });
+    return this;
+  }
+
+  delete(key) {
+    if (this._live(key) === undefined) return false; // missing, or expired (already purged)
+    return this.map.delete(key);
+  }
+
+  *keys() {
+    for (const key of [...this.map.keys()]) {
+      if (this._live(key)) yield key;
+    }
+  }
+
+  clear() {
+    this.map.clear();
+  }
+
+  // O(1); may count expired-but-unpurged entries, same as lru-cache without ttlAutopurge.
+  get size() {
+    return this.map.size;
+  }
+
+  getRemainingTTL(key) {
+    const e = this.map.get(key);
+    if (!e) return 0;
+    if (e.exp === 0) return Infinity;
+    const r = e.exp - Date.now();
+    return r > 0 ? r : 0;
+  }
+}
+
+/**
  * The authoritative key-value store, held in the broker process only.
- * Wraps lru-cache for size/TTL-based eviction. All mutations run on the broker's
- * single event loop, so atomic ops (incr/decr/cas) need no internal locking.
+ * All mutations run on the broker's single event loop, so atomic ops
+ * (incr/decr/cas) need no internal locking.
+ *
+ * Two backends: with any bound configured (max entries, maxSize byte budget,
+ * or a global ttl) it wraps lru-cache for size/TTL-based eviction; with no
+ * bounds at all it uses an unbounded Map (lru-cache refuses to construct
+ * without a bound). Per-item TTLs work on both.
  */
 class Store {
-  constructor({ max = 10000, ttl = 0, maxSize = 0 } = {}) {
+  constructor({ max, ttl = 0, maxSize = 0 } = {}) {
+    const bounded = (max != null && max > 0) || maxSize > 0 || ttl > 0;
+    if (!bounded) {
+      this.cache = new UnboundedTtlMap();
+      return;
+    }
     const opts = {};
-    // lru-cache requires at least one bound. We always set `max` unless a byte
-    // budget is given. Per-item TTLs work as long as the ttl feature is enabled,
-    // so we enable it with `ttl: 0` (no default expiry) when no global ttl is set.
     if (maxSize > 0) {
       opts.maxSize = maxSize;
       opts.sizeCalculation = approxSize;
-    } else {
+    } else if (max > 0) {
       opts.max = max;
     }
     opts.ttl = ttl > 0 ? ttl : 0;
-    opts.ttlAutopurge = ttl > 0; // proactively purge expired entries when a default ttl exists
+    // ttl-only config: autopurge makes the ttl a real bound (and avoids lru-cache's
+    // LRU_CACHE_UNBOUNDED warning when neither max nor maxSize is set).
+    opts.ttlAutopurge = ttl > 0;
     opts.allowStale = false;
     this.cache = new LRUCache(opts);
   }

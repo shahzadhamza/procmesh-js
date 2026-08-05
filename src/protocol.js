@@ -48,10 +48,6 @@ const TYPES = {
   RESULT: 'result',
 };
 
-const DEFAULT_MAX_FRAME = 64 * 1024 * 1024; // 64 MiB
-const DEFAULT_SEND_HWM = 16 * 1024 * 1024; // 16 MiB: soft cap, droppable frames dropped beyond this
-const DEFAULT_SEND_HARD_LIMIT = 64 * 1024 * 1024; // 64 MiB: hard cap, slow consumer is disconnected
-
 /**
  * Topic match. A subscription ending in `*` matches by prefix (everything before
  * the `*`); otherwise it must match the channel exactly. Predictable and cheap —
@@ -79,9 +75,10 @@ function encodeFrame(codec, obj) {
 
 /** Incremental decoder that buffers partial reads and yields complete frames. */
 class FrameDecoder {
-  constructor(codec, { maxFrameSize = DEFAULT_MAX_FRAME } = {}) {
+  constructor(codec, { maxFrameSize } = {}) {
     this.codec = codec;
-    this.maxFrameSize = maxFrameSize;
+    // No frame-size check unless the user configures one.
+    this.maxFrameSize = maxFrameSize > 0 ? maxFrameSize : undefined;
     this.buffer = Buffer.alloc(0);
   }
 
@@ -90,7 +87,7 @@ class FrameDecoder {
     for (;;) {
       if (this.buffer.length < 4) return;
       const len = this.buffer.readUInt32BE(0);
-      if (len > this.maxFrameSize) {
+      if (this.maxFrameSize !== undefined && len > this.maxFrameSize) {
         throw new Error(`frame too large: ${len} > ${this.maxFrameSize}`);
       }
       if (this.buffer.length < 4 + len) return;
@@ -114,8 +111,9 @@ class Peer extends EventEmitter {
     this.socket = socket;
     this.codec = codec;
     this.decoder = new FrameDecoder(codec, opts);
-    this.sendHighWaterMark = opts.sendHighWaterMark || DEFAULT_SEND_HWM;
-    this.sendHardLimit = opts.sendHardLimit || DEFAULT_SEND_HARD_LIMIT;
+    // undefined = never drop / never disconnect. Limits apply only when configured.
+    this.sendHighWaterMark = opts.sendHighWaterMark > 0 ? opts.sendHighWaterMark : undefined;
+    this.sendHardLimit = opts.sendHardLimit > 0 ? opts.sendHardLimit : undefined;
     socket.on('data', (chunk) => {
       try {
         this.decoder.push(chunk, (msg) => this.emit('message', msg));
@@ -129,7 +127,8 @@ class Peer extends EventEmitter {
   }
 
   /**
-   * Send a framed message, applying High-Water-Mark backpressure.
+   * Send a framed message, applying High-Water-Mark backpressure when configured
+   * (no limits by default — see sendHighWaterMark / sendHardLimit).
    *
    * - `droppable: true` (e.g. pub/sub fan-out): if the socket's outbound buffer
    *   already exceeds the soft HWM, the frame is DROPPED (returns 'dropped') so a
@@ -143,10 +142,10 @@ class Peer extends EventEmitter {
   send(obj, { droppable = false } = {}) {
     if (this.socket.destroyed) return false;
     const queued = this.socket.writableLength;
-    if (droppable && queued > this.sendHighWaterMark) {
+    if (droppable && this.sendHighWaterMark !== undefined && queued > this.sendHighWaterMark) {
       return 'dropped';
     }
-    if (!droppable && queued > this.sendHardLimit) {
+    if (!droppable && this.sendHardLimit !== undefined && queued > this.sendHardLimit) {
       this.socket.destroy(new Error('send buffer overflow (slow consumer)'));
       return 'overflow';
     }

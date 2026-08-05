@@ -45,11 +45,11 @@ Usage:
   procmesh stop      ask the broker to shut down
 
 serve pub/sub options:
-  --dedup-max <n>        idempotency dedup cache size (default 100000)
-  --dedup-ttl <ms>       idle TTL before a producer's dedup state ages out (default 600000)
+  --dedup-max <n>        idempotency dedup cache size (unbounded if unset)
+  --dedup-ttl <ms>       idle TTL before a producer's dedup state ages out (no expiry if unset)
   --no-dedup             disable idempotency dedup entirely
   --pubsub-persist       persist published messages (durable acks + replay-on-subscribe)
-  --pubsub-retention <n> retained messages per channel for replay (default 1000)
+  --pubsub-retention <n> retained messages per channel for replay (unlimited if unset; 0 = retain nothing)
 `);
 }
 

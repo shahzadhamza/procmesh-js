@@ -52,23 +52,30 @@ class Broker extends EventEmitter {
     this.persist.onError = (err) => this.emit('persist-error', err);
 
     // Idempotent-producer dedup: per (producerId, channel) highest accepted sequence, so a retried
-    // publish (same pid+seq) is delivered at most once. Bounded LRU + idle TTL keep memory in check;
-    // dedup.enabled:false turns it off entirely (pure at-most-once, zero dedup memory).
+    // publish (same pid+seq) is delivered at most once. Unbounded by default — set dedup.max and/or
+    // dedup.ttl to bound memory; dedup.enabled:false turns it off entirely (pure at-most-once,
+    // zero dedup memory).
     const dedupCfg = opts.dedup || {};
+    const dedupMax = dedupCfg.max > 0 ? dedupCfg.max : undefined;
+    const dedupTtl = dedupCfg.ttl > 0 ? dedupCfg.ttl : undefined;
     this.dedup =
       dedupCfg.enabled === false
         ? null
-        : new LRUCache({
-            max: dedupCfg.max || 100000,
-            ttl: dedupCfg.ttl == null ? 600000 : dedupCfg.ttl,
-            ttlAutopurge: false,
-            // Any read (including a dedup check) refreshes the entry's age, so an actively-publishing
-            // producer's window is never TTL-evicted out from under an in-flight retry.
-            updateAgeOnGet: true,
-          });
+        : dedupMax === undefined && dedupTtl === undefined
+          ? new Map() // no bounds configured (usage is only get/set/size)
+          : new LRUCache({
+              ...(dedupMax !== undefined ? { max: dedupMax } : {}),
+              ...(dedupTtl !== undefined ? { ttl: dedupTtl } : {}),
+              // ttl-only: autopurge makes the ttl a real bound (and silences lru-cache's
+              // LRU_CACHE_UNBOUNDED warning); with a max the LRU itself is the bound.
+              ttlAutopurge: dedupMax === undefined,
+              // Any read (including a dedup check) refreshes the entry's age, so an actively-publishing
+              // producer's window is never TTL-evicted out from under an in-flight retry.
+              updateAgeOnGet: true,
+            });
     // Per-(producer,channel) dedup window: how far below the highwater a retried/out-of-order seq
     // can still be recognized as a gap-fill (accept) vs a true duplicate (drop). Bounds per-entry
-    // memory to ~W seqs, so total dedup memory ≈ dedup.max × window.
+    // memory to ~W seqs.
     this.dedupWindow = dedupCfg.window || 1024;
     this.duplicates = 0; // count of deduped (retried) publishes
     this.nextPid = 1; // producer-id counter (see _mintPid)
@@ -78,14 +85,16 @@ class Broker extends EventEmitter {
     // fan-out reliability now); this governs crash-durability + replay. Off by default.
     const pubsubCfg = opts.pubsub || {};
     this.pubsubPersist = pubsubCfg.persist === true;
-    this.pubRetentionMax = pubsubCfg.retention == null ? 1000 : pubsubCfg.retention;
+    // Retained messages per channel: unset = unlimited; 0 = retain nothing (replay off); N>0 = ring of N.
+    this.pubRetentionMax = pubsubCfg.retention == null ? Infinity : pubsubCfg.retention;
     this.pubRetentionMs = pubsubCfg.retentionMs || 0;
     // Which acks level must be fsync'd BEFORE acking: 'all' (default) | 1 | false (never sync).
     this.durableAcks = pubsubCfg.durableAcks === undefined ? 'all' : pubsubCfg.durableAcks;
-    // channel -> [{ payload, seq, ts, offset }] (bounded). An LRU over channels caps the TOTAL
-    // number of retained channels (default 10000) so a producer using unbounded distinct channel
-    // names can't grow this without limit; the per-channel ring is separately capped in _retain.
-    this.pubRetention = new LRUCache({ max: pubsubCfg.maxChannels || 10000 });
+    // channel -> [{ payload, seq, ts, offset }]. Unbounded Map by default; set pubsub.maxChannels
+    // to cap the TOTAL number of retained channels with an LRU (so a producer using unbounded
+    // distinct channel names can't grow this without limit). The per-channel ring is separately
+    // trimmed in _retain when pubsub.retention is set.
+    this.pubRetention = pubsubCfg.maxChannels > 0 ? new LRUCache({ max: pubsubCfg.maxChannels }) : new Map();
     if (this.pubsubPersist) {
       // Recovered pub records aren't store state — route them to the retention ring, and re-append
       // still-retained ones after an AOF rewrite so replay survives compaction.
@@ -94,6 +103,7 @@ class Broker extends EventEmitter {
     }
 
     this.peerOpts = {
+      maxFrameSize: opts.maxFrameSize,
       sendHighWaterMark: opts.sendHighWaterMark,
       sendHardLimit: opts.sendHardLimit,
     };
@@ -259,9 +269,9 @@ class Broker extends EventEmitter {
     return this.nextOffset;
   }
 
-  /** Get-or-create the sliding-window dedup entry for a `${pid} ${channel}` key (refreshes LRU). */
+  /** Get-or-create the sliding-window dedup entry for a `${pid} ${channel}` key. */
   _dedupEntry(dkey) {
-    let e = this.dedup.get(dkey); // get() refreshes recency + age (updateAgeOnGet)
+    let e = this.dedup.get(dkey); // on the bounded LRU path, get() refreshes recency + age (updateAgeOnGet)
     if (!e) {
       e = { hi: 0, seen: new Set() };
       this.dedup.set(dkey, e);
@@ -596,10 +606,10 @@ class Broker extends EventEmitter {
     return offset;
   }
 
-  /** Append a message to a channel's bounded retention ring (for replay-on-subscribe). */
+  /** Append a message to a channel's retention ring (for replay-on-subscribe). */
   _retain(channel, payload, seq, ts = Date.now(), offset) {
-    // retention:0 means "retain nothing" (replay disabled), not "unbounded" — a ring capped at 0
-    // would otherwise grow without bound. `retention` defaults to 1000 when unset (see constructor).
+    // retention:0 means "retain nothing" (replay disabled); unset means unlimited
+    // (pubRetentionMax = Infinity, so the trim below never fires). See constructor.
     if (this.pubRetentionMax === 0) return;
     let ring = this.pubRetention.get(channel);
     if (!ring) {

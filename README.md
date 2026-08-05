@@ -144,13 +144,14 @@ const mesh = await createClient({
 // mesh.sequence('orders') / mesh.setSequence('orders', n) read/seed the counter to persist.
 ```
 
-(Dedup state is in-memory on the broker and bounded — see the `dedup` broker options — so
-cross-restart dedup holds only while the broker stays up and within the window/TTL.)
+(Dedup state is in-memory on the broker and unbounded by default — set `dedup.max`/`dedup.ttl`
+(see the `dedup` broker options) to bound it — so cross-restart dedup holds only while the broker
+stays up and within any configured max/TTL.)
 
 #### Persistence & replay (opt-in)
 
 By default pub/sub is in-memory and at-most-once. Turn on **`pubsub.persist`** broker-side to append
-published messages to the log and keep a bounded per-channel retention ring. A subscriber can then
+published messages to the log and keep a per-channel retention ring. A subscriber can then
 **replay** the recent backlog — and with a persist dir, messages survive a broker restart:
 
 ```js
@@ -165,10 +166,12 @@ With `acks:'all'` and persistence on, the broker fsyncs the message **before** a
 Each retained message gets a monotonic **offset**, and each subscriber tracks the highest offset it
 has seen. On reconnect the client resumes from that offset, so messages published while it was
 disconnected are **caught up** (delivered exactly once) rather than lost — this makes a reconnecting
-subscriber effectively at-least-once for anything still in the retention window. Retention is bounded
-(`pubsub.retention` per channel, `pubsub.maxChannels` total channels), so a message evicted before a
-slow consumer resumes is a gap in that best-effort window — this is a bounded replay buffer, not an
-infinite Kafka-style log.
+subscriber effectively at-least-once for anything still in the retention window. Retention is
+**unlimited by default**: with persist on, every published message is retained for replay — in memory
+and across log compactions — until you bound it (`pubsub.retention` messages per channel,
+`pubsub.retentionMs` by age, `pubsub.maxChannels` total channels). Bound it for long-running brokers;
+once bounded, a message evicted before a slow consumer resumes is a gap in that best-effort window —
+a replay buffer, not an infinite Kafka-style log.
 
 ### RPC (request/response across processes)
 ```js
@@ -354,7 +357,8 @@ await createClient({
                           //   PONG doesn't return in time (detects a dead broker on a half-open
                           //   socket / when the broker heartbeat is off). 0 = rely on broker heartbeat.
   token: undefined,       // shared secret; if the broker requires one, must match (else EAUTH)
-  cache: { max: 10_000, ttl: 0, maxSize: 0 },     // broker cache bounds (used when this client spawns the broker)
+  cache: {},              // broker cache bounds { max, ttl, maxSize } — unbounded unless at least one
+                          //   is set (used when this client spawns the broker)
   shards: undefined,      // scale past one core: a count N, or an array of broker addresses/names (see Sharding)
   pubsub: {               // producer defaults for publish() (per-call opts override); also carries the
                           //   broker persist knobs below, forwarded to an auto-spawned broker
@@ -379,30 +383,40 @@ createBroker({
                                //   connected (frees pending state + worker inflight). Used when a
                                //   caller doesn't send its own per-call timeout; otherwise caller's + grace.
   heartbeatInterval: 30_000,   // ms; broker pings idle conns and reaps unresponsive ones (3× interval)
-  sendHighWaterMark: 16<<20,   // bytes; pub/sub frames dropped for a consumer buffered past this
-  sendHardLimit: 64<<20,       // bytes; a consumer buffered past this is disconnected (slow-consumer protection)
+  sendHighWaterMark: undefined,// bytes; if set, pub/sub frames are dropped for a consumer buffered
+                               //   past this (unset = never drop)
+  sendHardLimit: undefined,    // bytes; if set, a consumer buffered past this is disconnected
+                               //   (slow-consumer protection; unset = never disconnect)
+  maxFrameSize: undefined,     // bytes; if set, an inbound frame larger than this kills the
+                               //   connection (unset = no frame-size check)
   idleTimeout: 0,              // ms; auto-shutdown after the last client leaves (0 = never)
   statsInterval: 0,            // ms; if set, emit a 'stats' snapshot on this interval (0 = off)
-  cache: { max: 10_000, ttl: 0, maxSize: 0 },
+  cache: {},                   // { max, ttl, maxSize } — unbounded unless at least one is set
   persist: undefined,          // crash-survival persistence — see below (off by default)
-  dedup: {                     // idempotent-producer dedup store (bounds retry-dedup memory)
+  dedup: {                     // idempotent-producer dedup store (unbounded by default)
     enabled: true,             //   false = ignore pid/seq entirely (pure at-most-once, zero memory)
-    max: 100_000,              //   max (producerId, channel) entries
-    ttl: 600_000,              //   ms idle before a producer's dedup state ages out
+    max: undefined,            //   max (producerId, channel) entries (unset = unbounded)
+    ttl: undefined,            //   ms idle before a producer's dedup state ages out (unset = no expiry)
     window: 1024,              //   per-entry sliding window: how far below the highwater a retried/
                                //   out-of-order seq can still be recognized (gap-fill vs duplicate)
   },
   pubsub: {                    // opt-in pub/sub message persistence (orthogonal to acks)
     persist: false,            //   append published messages to the AOF + keep a retention ring
-    retention: 1000,           //   retained messages per channel for replay (count)
+    retention: undefined,      //   retained messages per channel (unset = unlimited; 0 = retain nothing)
     retentionMs: 0,            //   OR age-based retention in ms (0 = count-only)
-    maxChannels: 10_000,       //   cap on the number of retained channels (LRU-evicted; DoS guard)
+    maxChannels: undefined,    //   cap on the number of retained channels (LRU-evicted when set;
+                               //   unset = uncapped)
     durableAcks: 'all',        //   which acks level fsyncs BEFORE acking: 'all' | 1 | false
   },
 });
 ```
 CLI equivalents on `procmesh serve`: `--dedup-max`, `--dedup-ttl`, `--no-dedup`, `--pubsub-persist`,
 `--pubsub-retention`.
+
+> **No limits by default.** The cache, dedup state, pub/sub retention, and per-connection send
+> buffers/frame sizes are all unbounded unless you configure them. For long-running brokers or
+> untrusted workloads, set explicit bounds — e.g. `cache: { max }`, `dedup: { max, ttl }`,
+> `pubsub: { retention, maxChannels }`, `sendHighWaterMark`, `sendHardLimit`, `maxFrameSize`.
 
 ## How it works
 
@@ -417,10 +431,11 @@ node app-a   node app-b   node worker
 
 - **Transport:** Node's built-in `net` only — zero native dependencies.
 - **Framing:** 4-byte length-prefixed frames; JSON payloads by default.
-- **Eviction/TTL:** backed by [`lru-cache`](https://www.npmjs.com/package/lru-cache).
-- **Robustness:** per-connection high-water-mark backpressure (slow consumers can't OOM the
-  broker), heartbeats that reap dead connections, worker-pool RPC with least-busy dispatch,
-  and optional shared-secret auth.
+- **Eviction/TTL:** backed by [`lru-cache`](https://www.npmjs.com/package/lru-cache) when cache
+  bounds are configured; unbounded by default.
+- **Robustness:** optional per-connection high-water-mark backpressure (set `sendHighWaterMark`/
+  `sendHardLimit` so slow consumers can't OOM the broker — no limits by default), heartbeats that
+  reap dead connections, worker-pool RPC with least-busy dispatch, and optional shared-secret auth.
 
 ## Limitations (v1)
 
@@ -433,7 +448,7 @@ node app-a   node app-b   node worker
   with it, locks are released on restart (they're connection-scoped). Pub/sub is at-most-once by
   default (messages published during a disconnect aren't buffered); for stronger guarantees use
   `acks:'all'` (no-drop fan-out), `idempotent` (dedup'd retries), and `pubsub.persist` (durable
-  publish + bounded replay-on-subscribe) — see [Pub/Sub](#pubsub).
+  publish + replay-on-subscribe) — see [Pub/Sub](#pubsub).
 - Every cache op is a local IPC round-trip (~0.05–0.2 ms). Fine for coordination;
   not a substitute for a per-process hot cache in ultra-hot paths.
 

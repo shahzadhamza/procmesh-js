@@ -134,7 +134,11 @@ class Client extends EventEmitter {
       socket.once('error', onError);
       socket.once('connect', async () => {
         socket.removeListener('error', onError);
-        this.peer = new Peer(socket, this.codec);
+        this.peer = new Peer(socket, this.codec, {
+          maxFrameSize: this.opts.maxFrameSize,
+          sendHighWaterMark: this.opts.sendHighWaterMark,
+          sendHardLimit: this.opts.sendHardLimit,
+        });
         this.connected = true;
         this._reconnectAttempt = 0;
         this.peer.on('message', (msg) => this._onMessage(msg));
@@ -172,6 +176,10 @@ class Client extends EventEmitter {
       dedup: this.opts.dedup,
       pubsub: this.opts.pubsub,
       persist: this.opts.persist,
+      // Per-connection limits (no limits unless configured).
+      maxFrameSize: this.opts.maxFrameSize,
+      sendHighWaterMark: this.opts.sendHighWaterMark,
+      sendHardLimit: this.opts.sendHardLimit,
     };
     const child = spawn(process.execPath, [path.join(__dirname, 'broker-bin.js')], {
       detached: true,
