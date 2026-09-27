@@ -18,10 +18,24 @@ function fnv1a(str) {
   return h >>> 0;
 }
 
+/**
+ * Redis-style hash tag: if the key contains `{…}` with a non-empty body, only that body is hashed
+ * (the first `{` and the first `}` after it). `{account:42}` and `{account:42}:balance` therefore
+ * land on the same shard — which is how a lock key and the data its fenced writes guard stay
+ * colocated. Keys without a tag hash in full, exactly as before.
+ */
+function hashSlotKey(key) {
+  const open = key.indexOf('{');
+  if (open === -1) return key;
+  const close = key.indexOf('}', open + 1);
+  if (close === -1 || close === open + 1) return key;
+  return key.slice(open + 1, close);
+}
+
 /** Pick the shard index for a key given the number of shards. */
 function shardIndex(key, n) {
   if (n <= 1) return 0;
-  return fnv1a(String(key)) % n;
+  return fnv1a(hashSlotKey(String(key))) % n;
 }
 
-module.exports = { fnv1a, shardIndex };
+module.exports = { fnv1a, hashSlotKey, shardIndex };

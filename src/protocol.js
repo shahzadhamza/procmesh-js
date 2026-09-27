@@ -73,29 +73,74 @@ function encodeFrame(codec, obj) {
   return frame;
 }
 
-/** Incremental decoder that buffers partial reads and yields complete frames. */
+/**
+ * Incremental decoder that buffers partial reads and yields complete frames.
+ *
+ * Chunks are queued, not concatenated on arrival: re-concatenating the whole buffer on every read
+ * made a large frame quadratic (a 100MB frame in 64KB reads copied ~80GB). Here each byte is copied
+ * at most once — only when a frame straddles chunks.
+ */
 class FrameDecoder {
   constructor(codec, { maxFrameSize } = {}) {
     this.codec = codec;
     // No frame-size check unless the user configures one.
     this.maxFrameSize = maxFrameSize > 0 ? maxFrameSize : undefined;
-    this.buffer = Buffer.alloc(0);
+    this.chunks = [];
+    this.length = 0; // total buffered bytes across `chunks`
   }
 
   push(chunk, onMessage) {
-    this.buffer = this.buffer.length ? Buffer.concat([this.buffer, chunk]) : chunk;
+    if (chunk.length) {
+      this.chunks.push(chunk);
+      this.length += chunk.length;
+    }
     for (;;) {
-      if (this.buffer.length < 4) return;
-      const len = this.buffer.readUInt32BE(0);
+      if (this.length < 4) return;
+      const len = this._peekLength();
       if (this.maxFrameSize !== undefined && len > this.maxFrameSize) {
         throw new Error(`frame too large: ${len} > ${this.maxFrameSize}`);
       }
-      if (this.buffer.length < 4 + len) return;
-      const payload = this.buffer.subarray(4, 4 + len);
-      const obj = this.codec.decode(payload);
-      this.buffer = this.buffer.subarray(4 + len);
+      if (this.length < 4 + len) return;
+      this._consume(4);
+      const obj = this.codec.decode(this._consume(len));
       onMessage(obj);
     }
+  }
+
+  /** Read the uint32 length prefix without consuming it (it may straddle chunks). */
+  _peekLength() {
+    const first = this.chunks[0];
+    if (first.length >= 4) return first.readUInt32BE(0);
+    const head = Buffer.allocUnsafe(4);
+    let off = 0;
+    for (const c of this.chunks) {
+      off += c.copy(head, off, 0, Math.min(c.length, 4 - off));
+      if (off === 4) break;
+    }
+    return head.readUInt32BE(0);
+  }
+
+  /** Remove and return the next `n` bytes: zero-copy when they sit in one chunk. */
+  _consume(n) {
+    this.length -= n;
+    const first = this.chunks[0];
+    if (n === 0) return Buffer.alloc(0);
+    if (first.length >= n) {
+      if (first.length === n) this.chunks.shift();
+      else this.chunks[0] = first.subarray(n);
+      return first.subarray(0, n);
+    }
+    const out = Buffer.allocUnsafe(n);
+    let off = 0;
+    while (off < n) {
+      const c = this.chunks[0];
+      const k = Math.min(c.length, n - off);
+      c.copy(out, off, 0, k);
+      off += k;
+      if (k === c.length) this.chunks.shift();
+      else this.chunks[0] = c.subarray(k);
+    }
+    return out;
   }
 }
 
@@ -115,8 +160,19 @@ class Peer extends EventEmitter {
     this.sendHighWaterMark = opts.sendHighWaterMark > 0 ? opts.sendHighWaterMark : undefined;
     this.sendHardLimit = opts.sendHardLimit > 0 ? opts.sendHardLimit : undefined;
     socket.on('data', (chunk) => {
+      // Only a DECODE failure is a protocol error that kills the link. An exception thrown by a
+      // 'message' listener is isolated to that one message, so a single bad handler can't tear
+      // down the connection and drop the rest of the chunk. Frames are dispatched as they are
+      // decoded, so a listener can change decoder limits (e.g. lift the pre-auth frame cap on
+      // HELLO) before the next frame in the same chunk is decoded.
       try {
-        this.decoder.push(chunk, (msg) => this.emit('message', msg));
+        this.decoder.push(chunk, (msg) => {
+          try {
+            this.emit('message', msg);
+          } catch (err) {
+            process.emitWarning(err instanceof Error ? err : new Error(String(err)), 'ProcMeshWarning');
+          }
+        });
       } catch (err) {
         this.emit('error', err);
         socket.destroy(err);
@@ -150,6 +206,11 @@ class Peer extends EventEmitter {
       return 'overflow';
     }
     return this.socket.write(encodeFrame(this.codec, obj));
+  }
+
+  /** Graceful close: flush queued writes, then FIN. */
+  end() {
+    this.socket.end();
   }
 
   destroy() {

@@ -359,3 +359,25 @@ test('pub/sub persistence: retained messages survive a broker restart (durable a
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('an idempotent publish whose first attempt is lost is retried within the deadline', async () => {
+  const b = await startBroker();
+  const origHandle = b._handle.bind(b);
+  let dropped = false;
+  b._handle = (conn, msg) => {
+    if (msg && msg.t === 'pub' && !dropped) {
+      dropped = true; // swallow the first attempt: no reply ever comes
+      return;
+    }
+    origHandle(conn, msg);
+  };
+  const c = await client(b);
+  try {
+    const res = await c.publish('retry-ch', 'x', { idempotent: true, retries: 3, timeout: 800, retryBackoff: 1 });
+    assert.strictEqual(res, 0, 'second attempt landed');
+    assert.ok(dropped);
+  } finally {
+    await c.close();
+    await b.close();
+  }
+});

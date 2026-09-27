@@ -47,3 +47,27 @@ test('broker without a token accepts everyone (zero-config default preserved)', 
     await broker.close();
   }
 });
+
+test('an unauthenticated peer cannot make the broker buffer a huge frame', async () => {
+  const net = require('node:net');
+  const { client, once } = require('./helpers');
+  const broker = await startBroker({ token: 's3cret' });
+  try {
+    const raw = net.connect(broker.address);
+    await once(raw, 'connect');
+    const header = Buffer.alloc(4);
+    header.writeUInt32BE(512 * 1024 * 1024, 0); // claims a 512MB frame before any HELLO
+    raw.write(header);
+    raw.on('error', () => {});
+    await once(raw, 'close');
+
+    // An authenticated client may still send frames far above the pre-auth cap.
+    const c = await client(broker, { token: 's3cret' });
+    const big = 'y'.repeat(256 * 1024);
+    await c.set('big', big);
+    assert.strictEqual((await c.get('big')).length, big.length);
+    await c.close();
+  } finally {
+    await broker.close();
+  }
+});

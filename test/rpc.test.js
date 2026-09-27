@@ -130,3 +130,35 @@ test('worker pool survives one worker disconnecting', async () => {
     await w2.close();
   }
 });
+
+test('a RESULT from a connection that does not own the call is ignored', async () => {
+  const intruder = await client(broker);
+  const w = await client(broker);
+  try {
+    let finish;
+    await w.register('owned', () => new Promise((r) => (finish = r)));
+    const pending = caller.call('owned', [], { timeout: 3000 });
+    await delay(30);
+    // Forge replies for every plausible (sequential) broker call id.
+    for (let id = 1; id <= 200; id++) intruder.peer.send({ t: 'result', id, result: 'forged' });
+    await delay(30);
+    finish('genuine');
+    assert.strictEqual(await pending, 'genuine');
+  } finally {
+    await intruder.close();
+    await w.close();
+  }
+});
+
+test('a handler that throws a non-Error is relayed, and the worker survives', async () => {
+  const w = await client(broker);
+  try {
+    await w.register('throws-null', () => {
+      throw null; // eslint-disable-line no-throw-literal
+    });
+    await assert.rejects(() => caller.call('throws-null', []), (err) => err.code === 'EHANDLER');
+    assert.ok(w.connected, 'worker still connected');
+  } finally {
+    await w.close();
+  }
+});

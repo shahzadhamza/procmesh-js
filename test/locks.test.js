@@ -142,3 +142,72 @@ test('withLock runs the critical section and always releases', async () => {
     await b.close();
   }
 });
+
+test('a stale release from an expired grant does not free the next grant on the same connection', async () => {
+  const c = await client(broker);
+  const other = await client(broker);
+  try {
+    const relA = await c.lock('shared-conn', { ttl: 60, wait: 0 });
+    assert.ok(relA, 'task A acquires');
+    // Task B on the SAME client queues; A's TTL expires and B is granted (same connection).
+    const relB = await c.lock('shared-conn', { ttl: 5000, wait: 2000 });
+    assert.ok(relB, 'task B acquires after A overruns its TTL');
+    assert.ok(relB.token > relA.token);
+
+    await relA(); // A finishes late and releases — must NOT release B's grant
+    assert.strictEqual(await other.lock('shared-conn', { wait: 0 }), null, 'B still holds the lock');
+
+    await relB();
+    const relC = await other.lock('shared-conn', { wait: 0 });
+    assert.ok(relC, 'released once B lets go');
+    await relC();
+  } finally {
+    await c.close();
+    await other.close();
+  }
+});
+
+test('token exhaustion is reported as an error, not an unhandled rejection', async () => {
+  const b2 = await startBroker();
+  const c = await client(b2);
+  try {
+    b2.nextToken = Number.MAX_SAFE_INTEGER;
+    await assert.rejects(() => c.lock('last', { wait: 0 }), (e) => e.code === 'EFENCEEXHAUSTED');
+  } finally {
+    await c.close();
+    await b2.close();
+  }
+});
+
+test('a lock granted after the client timed out is released, not held until TTL', async () => {
+  const b2 = await startBroker();
+  const orig = b2.locks.acquire.bind(b2.locks);
+  b2.locks.acquire = (...args) => delay(150).then(() => orig(...args)); // a slow broker
+  const slow = await client(b2, { callTimeout: 50 });
+  const other = await client(b2);
+  try {
+    await assert.rejects(() => slow.lock('late', { wait: 0, ttl: 60000 }), (e) => e.code === 'ETIMEOUT');
+    await delay(250); // the grant lands, and the client hands it straight back
+    b2.locks.acquire = orig;
+    const rel = await other.lock('late', { wait: 0 });
+    assert.ok(rel, 'lock is free again');
+    await rel();
+  } finally {
+    await slow.close();
+    await other.close();
+    await b2.close();
+  }
+});
+
+test('malformed lock and incr arguments are rejected with EINVAL', async () => {
+  const c = await client(broker);
+  try {
+    await assert.rejects(() => c.incr('n', '5'), (e) => e.code === 'EINVAL');
+    assert.strictEqual(await c.get('n'), undefined, 'nothing was stored');
+    await assert.rejects(() => c.lock('bad-ttl', { ttl: -1, wait: 0 }), (e) => e.code === 'EINVAL');
+    await assert.rejects(() => c._request('sub', { channel: 5 }), (e) => e.code === 'EINVAL');
+    await assert.rejects(() => c._request('call', { name: {} }), (e) => e.code === 'EINVAL');
+  } finally {
+    await c.close();
+  }
+});

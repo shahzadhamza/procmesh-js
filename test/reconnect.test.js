@@ -86,3 +86,44 @@ test('autoSpawn starts a broker when none is running', async () => {
     await c.close();
   }
 });
+
+test('a failed handshake leaves the client disconnected, not half-open', async () => {
+  const address = resolveAddress(uniqueName());
+  const sockets = [];
+  const mute = net.createServer((s) => {
+    sockets.push(s); // accepts, never answers HELLO
+    s.resume(); // flowing, so the client's FIN surfaces as end → close
+  });
+  await new Promise((r) => mute.listen(address, r));
+  try {
+    await assert.rejects(
+      () => createClient({ address, autoSpawn: false, reconnect: false, callTimeout: 150 }),
+      (e) => e.code === 'ETIMEOUT'
+    );
+    await new Promise((r) => setTimeout(r, 50));
+    assert.ok(sockets.length > 0 && sockets.every((s) => s.destroyed), 'client dropped the half-open socket');
+  } finally {
+    for (const s of sockets) s.destroy();
+    await new Promise((r) => mute.close(r));
+  }
+});
+
+test('the default socket dir is refused if another user could write into it', { skip: typeof process.getuid !== 'function' }, () => {
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const path = require('node:path');
+  const { assertPrivateDir } = require('../src/transport');
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'pm-dir-'));
+  const open = path.join(base, 'open');
+  fs.mkdirSync(open);
+  fs.chmodSync(open, 0o777);
+  assert.throws(() => assertPrivateDir(open), (e) => e.code === 'EUNSAFEDIR');
+  const link = path.join(base, 'link');
+  fs.symlinkSync(base, link);
+  assert.throws(() => assertPrivateDir(link), (e) => e.code === 'EUNSAFEDIR');
+  const fresh = path.join(base, 'fresh');
+  assertPrivateDir(fresh, { create: true });
+  assert.strictEqual(fs.statSync(fresh).mode & 0o777, 0o700);
+  assert.doesNotThrow(() => assertPrivateDir(path.join(base, 'missing')), 'missing + no create is fine');
+  fs.rmSync(base, { recursive: true, force: true });
+});

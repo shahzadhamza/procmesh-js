@@ -6,7 +6,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { fork } = require('child_process');
-const { createClient, resolveAddress } = require('../src');
+const { createClient, createBroker, resolveAddress } = require('../src');
 const { Persistence, NullPersistence } = require('../src/persistence');
 const Store = require('../src/store');
 const { jsonCodec } = require('../src/codec');
@@ -22,7 +22,7 @@ function tmpDir() {
 }
 
 /** Fork a real broker process with persistence; resolve once it reports ready. */
-function spawnBroker(name, address, dir) {
+function spawnBroker(name, address, dir, extra = {}) {
   const child = fork(BROKER_BIN, [], {
     env: {
       ...process.env,
@@ -32,6 +32,7 @@ function spawnBroker(name, address, dir) {
         idleTimeout: 0,
         heartbeatInterval: 0,
         persist: { dir, mode: 'always' }, // synchronous fsync → deterministic across kill -9
+        ...extra,
       }),
     },
   });
@@ -162,4 +163,165 @@ test('NullPersistence is a no-op and reports loadedToken 0', async () => {
   p.noteToken(5);
   assert.strictEqual(p.loadedToken, 0);
   await p.flushAndClose();
+});
+
+test('a superseded pre-crash fencing token is rejected after a broker restart', async () => {
+  const name = `fence-${process.pid}-${Math.random().toString(36).slice(2, 7)}`;
+  const address = resolveAddress(name);
+  const dir = tmpDir();
+  const opts = { name, address, idleTimeout: 0, heartbeatInterval: 0, persist: { dir, mode: 'always' } };
+
+  let broker = await createBroker(opts).start();
+  let a = await createClient({ address, autoSpawn: false, reconnect: false });
+  let b = await createClient({ address, autoSpawn: false, reconnect: false });
+  const relA = await a.lock('acct', { ttl: 50, wait: 0 });
+  await delay(100); // A overruns its TTL
+  const relB = await b.lock('acct', { wait: 0 });
+  assert.strictEqual(await b.fencedSet('acct', relB.token, 'bal', 'from-B'), true);
+  await a.close();
+  await b.close();
+  await broker.close();
+
+  broker = await createBroker(opts).start();
+  a = await createClient({ address, autoSpawn: false, reconnect: false });
+  try {
+    await assert.rejects(() => a.fencedSet('acct', relA.token, 'bal', 'stale-A'), (e) => e.code === 'EFENCED');
+    assert.strictEqual(await a.get('bal'), 'from-B', 'stale write did not land');
+    const rel = await a.lock('acct', { wait: 0 });
+    assert.ok(rel.token > relB.token, 'new grants still outrank every pre-crash token');
+    assert.strictEqual(await a.fencedSet('acct', rel.token, 'bal', 'fresh'), true);
+    await rel();
+  } finally {
+    await a.close();
+    await broker.close();
+  }
+});
+
+test('acked retained messages survive kill -9 right after an AOF compaction, without duplicates', async () => {
+  const name = `pubc-${process.pid}-${Math.random().toString(36).slice(2, 7)}`;
+  const address = resolveAddress(name);
+  const dir = tmpDir();
+  const extra = { persist: { dir, mode: 'no', aofRewriteOps: 5 }, pubsub: { persist: true } };
+
+  let broker = await spawnBroker(name, address, dir, extra);
+  let c = await createClient({ address, autoSpawn: false, reconnect: false });
+  for (let i = 1; i <= 12; i++) await c.publish('orders', { i }, { acks: 'all' }); // compacts twice
+  await c.close();
+  broker.kill('SIGKILL');
+  await delay(100);
+
+  for (let round = 0; round < 2; round++) {
+    // Restart twice: recovered records must not be re-retained on each boot.
+    broker = await spawnBroker(name, address, dir, extra);
+    c = await createClient({ address, autoSpawn: false, reconnect: false });
+    const got = [];
+    await c.subscribe('orders', (m) => got.push(m.i), { replay: true });
+    await delay(100);
+    await c.close();
+    broker.kill('SIGKILL');
+    await delay(100);
+    assert.deepStrictEqual(got, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12], `round ${round}`);
+  }
+});
+
+test('a recovered pub record raises the offset seed past a lost reservation', async () => {
+  const dir = tmpDir();
+  // An fsync'd pub record whose covering offset reservation never made it to disk.
+  fs.writeFileSync(path.join(dir, 'aof.bin'), encodeFrame(jsonCodec, { op: 'pub', ch: 'c', payload: 1, ts: Date.now(), offset: 5000 }));
+  const name = `off-${process.pid}-${Math.random().toString(36).slice(2, 7)}`;
+  const broker = await createBroker({ name, idleTimeout: 0, persist: { dir, mode: 'no' }, pubsub: { persist: true } }).start();
+  try {
+    assert.ok(broker.nextOffset >= 5000, `seed ${broker.nextOffset} covers the recovered offset`);
+  } finally {
+    await broker.close();
+  }
+});
+
+test('a graceful restart never rolls a key back to an older value', async () => {
+  const name = `roll-${process.pid}-${Math.random().toString(36).slice(2, 7)}`;
+  const dir = tmpDir();
+  const opts = { name, idleTimeout: 0, heartbeatInterval: 0, persist: { dir, mode: 'no' } };
+  let broker = await createBroker(opts).start();
+  let c = await createClient({ address: broker.address, autoSpawn: false, reconnect: false });
+  await Promise.all(Array.from({ length: 300 }, (_, i) => c.set('k', i)));
+  await c.close();
+  await broker.close();
+
+  broker = await createBroker(opts).start();
+  c = await createClient({ address: broker.address, autoSpawn: false, reconnect: false });
+  try {
+    assert.strictEqual(await c.get('k'), 299);
+  } finally {
+    await c.close();
+    await broker.close();
+  }
+});
+
+test('idempotent dedup is rebuilt from retained messages after a restart', async () => {
+  const name = `dd-${process.pid}-${Math.random().toString(36).slice(2, 7)}`;
+  const dir = tmpDir();
+  const opts = { name, idleTimeout: 0, heartbeatInterval: 0, persist: { dir, mode: 'always' }, pubsub: { persist: true } };
+  const producer = { pubsub: { producerId: 'stable-p', idempotent: true } };
+  let broker = await createBroker(opts).start();
+  let c = await createClient({ address: broker.address, autoSpawn: false, reconnect: false, ...producer });
+  assert.strictEqual(await c.publish('jobs', 'j1'), 0);
+  await c.close();
+  await broker.close();
+
+  broker = await createBroker(opts).start();
+  c = await createClient({ address: broker.address, autoSpawn: false, reconnect: false, ...producer });
+  try {
+    c.setSequence('jobs', 0); // the retry re-sends seq 1 after the restart
+    assert.strictEqual(await c.publish('jobs', 'j1'), null, 'recognized as a duplicate');
+    const got = [];
+    await c.subscribe('jobs', (m) => got.push(m), { replay: true });
+    await delay(50);
+    assert.deepStrictEqual(got, ['j1'], 'retained once');
+  } finally {
+    await c.close();
+    await broker.close();
+  }
+});
+
+test('corrupt snapshot is preserved on disk and reported', async () => {
+  const dir = tmpDir();
+  fs.writeFileSync(path.join(dir, 'snapshot.bin'), Buffer.from('garbage'));
+  const store = new Store({});
+  const p = new Persistence({ dir, mode: 'no', codec: jsonCodec });
+  const errs = [];
+  p.onError = (e) => errs.push(e);
+  await p.load(store);
+  await p.flushAndClose();
+  assert.ok(fs.readdirSync(dir).some((f) => f.startsWith('snapshot.bin.corrupt-')), 'kept aside');
+  assert.ok(errs.some((e) => e.code === 'EPERSISTCORRUPT'));
+});
+
+test('replay honors retentionMs even on a channel that went quiet', async () => {
+  const name = `rms-${process.pid}-${Math.random().toString(36).slice(2, 7)}`;
+  const broker = await createBroker({ name, idleTimeout: 0, pubsub: { persist: true, retentionMs: 50 } }).start();
+  const c = await createClient({ address: broker.address, autoSpawn: false, reconnect: false });
+  try {
+    await c.publish('quiet', 'stale');
+    await delay(100);
+    const got = [];
+    await c.subscribe('quiet', (m) => got.push(m), { replay: true });
+    await delay(30);
+    assert.deepStrictEqual(got, [], 'expired message not replayed');
+  } finally {
+    await c.close();
+    await broker.close();
+  }
+});
+
+test('two brokers racing on a stale socket file never both listen', { skip: process.platform === 'win32' }, async () => {
+  const name = `race-${process.pid}-${Math.random().toString(36).slice(2, 7)}`;
+  const address = resolveAddress(name);
+  fs.writeFileSync(address, ''); // a stale non-socket entry at the address
+  const results = await Promise.allSettled([0, 1, 2].map(() => createBroker({ name, address, idleTimeout: 0 }).start()));
+  const up = results.filter((r) => r.status === 'fulfilled').map((r) => r.value);
+  try {
+    assert.strictEqual(up.length, 1, 'exactly one broker owns the address');
+  } finally {
+    await Promise.all(up.map((b) => b.close()));
+  }
 });

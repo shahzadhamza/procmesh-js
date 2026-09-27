@@ -113,3 +113,36 @@ test('a never-locked key accepts the first legitimate token', async () => {
     await c.close();
   }
 });
+
+test('fenced writes reject non-integer and never-issued tokens without poisoning the key', async () => {
+  const c = await client(broker);
+  try {
+    await assert.rejects(() => c.fencedSet('poison', 'abc', 'k', 1), (e) => e.code === 'EFENCED');
+    await assert.rejects(() => c.fencedSet('poison', 1e15, 'k', 1), (e) => e.code === 'EFENCED');
+    // A real grant on the same key still works: the bogus token did not raise the bar.
+    const rel = await c.lock('poison', { wait: 0 });
+    assert.ok(rel);
+    assert.strictEqual(await c.fencedSet('poison', rel.token, 'k', 'ok'), true);
+    assert.strictEqual(await c.get('k'), 'ok');
+    await rel();
+  } finally {
+    await c.close();
+  }
+});
+
+test('a fenced rejection is an errors.Fenced (and still a RemoteError)', async () => {
+  const { errors } = require('../src');
+  const c = await client(broker);
+  try {
+    const rel = await c.lock('typed', { ttl: 30, wait: 0 });
+    await delay(60);
+    const rel2 = await c.lock('typed', { wait: 0 });
+    await assert.rejects(
+      () => c.fencedSet('typed', rel.token, 'k', 1),
+      (e) => e instanceof errors.Fenced && e instanceof errors.RemoteError && e.code === 'EFENCED'
+    );
+    await rel2();
+  } finally {
+    await c.close();
+  }
+});

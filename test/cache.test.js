@@ -70,3 +70,22 @@ test('incr preserves an existing per-item TTL (does not make the key immortal)',
   await delay(180);
   assert.strictEqual(await b.get('counter'), undefined, 'TTL still fired after incr');
 });
+
+test('an unencodable value rejects immediately without leaking a pending request', async () => {
+  await assert.rejects(() => a.set('big', 10n), TypeError);
+  assert.strictEqual(a.pending.size, 0);
+});
+
+test('a value larger than cache.maxSize is rejected, not silently dropped', async () => {
+  const b2 = await startBroker({ cache: { maxSize: 100 } });
+  const c = await client(b2);
+  try {
+    await assert.rejects(() => c.set('huge', 'x'.repeat(500)), (e) => e.code === 'ETOOLARGE');
+    await c.set('small', 'ok');
+    await assert.rejects(() => c.mset({ small: 'changed', huge: 'x'.repeat(500) }), (e) => e.code === 'ETOOLARGE');
+    assert.strictEqual(await c.get('small'), 'ok', 'mset is all-or-nothing');
+  } finally {
+    await c.close();
+    await b2.close();
+  }
+});

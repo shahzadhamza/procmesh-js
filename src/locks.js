@@ -19,6 +19,10 @@ class LockManager {
   constructor({ mintToken } = {}) {
     this.locks = new Map(); // key -> { owner, ttl, timer, token, waiters: [{ connId, ttl, resolve, timer }] }
     this.fenceHigh = new Map(); // lockKey -> highest fencing token ever issued (never deleted)
+    // Every token issued by a PREVIOUS broker incarnation is <= this floor (the broker sets it to its
+    // seeded token counter at start). The per-key high-water above is in-memory only, so without the
+    // floor a superseded pre-crash token would pass a fenced write after restart. 0 = no floor.
+    this.fenceFloor = 0;
     let n = 0;
     this.mintToken = mintToken || (() => (n += 1));
   }
@@ -49,9 +53,15 @@ class LockManager {
     });
   }
 
-  release(key, connId) {
+  /**
+   * Release `key` if `connId` holds it. When `token` is given, the release applies only to that
+   * grant: a stale release from an earlier grant (TTL expired, then re-granted to another task on the
+   * SAME connection) must not free the current holder's lock. `token == null` = legacy by-conn release.
+   */
+  release(key, connId, token) {
     const lock = this.locks.get(key);
     if (!lock || lock.owner !== connId) return false;
+    if (token != null && lock.token !== token) return false;
     this._release(key);
     return true;
   }
@@ -113,9 +123,13 @@ class LockManager {
     if (token > cur) this.fenceHigh.set(key, token);
   }
 
-  /** Highest fencing token ever issued for a key (0 if never locked). */
+  /**
+   * Lowest token a fenced write on `key` may present: the highest issued for it in this incarnation,
+   * and always above every token issued before the broker restarted (see fenceFloor).
+   */
   getFenceHigh(key) {
-    return this.fenceHigh.get(key) || 0;
+    const high = this.fenceHigh.get(key) || 0;
+    return this.fenceFloor > 0 ? Math.max(high, this.fenceFloor + 1) : high;
   }
 
   /** Lightweight observability snapshot: held lock count and total queued waiters. */

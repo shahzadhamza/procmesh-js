@@ -2,11 +2,13 @@
 
 const net = require('net');
 const fs = require('fs');
+const crypto = require('crypto');
 const EventEmitter = require('events');
 const { LRUCache } = require('lru-cache');
 const { Peer, TYPES, PROTOCOL_VERSION, matchTopic, isPattern } = require('./protocol');
 const { resolveCodec } = require('./codec');
-const { resolveAddress, isPipe } = require('./transport');
+const path = require('path');
+const { resolveAddress, isPipe, isDefaultSocket, assertPrivateDir, tryPidLock, releasePidLock } = require('./transport');
 const Store = require('./store');
 const LockManager = require('./locks');
 const { createPersistence } = require('./persistence');
@@ -16,6 +18,26 @@ const KNOWN_TYPES = new Set(Object.values(TYPES));
 
 /** Extra time past a caller's deadline before the broker reaps a hung RPC call (cleanup backstop). */
 const CALL_TIMEOUT_GRACE = 5000;
+
+/**
+ * Frame-size cap for a connection that hasn't authenticated yet (only when a token is configured).
+ * HELLO is tiny; without this an unauthenticated peer could make the broker buffer a frame up to
+ * 4GB. Lifted to the configured maxFrameSize the moment HELLO succeeds.
+ */
+const PREAUTH_MAX_FRAME = 64 * 1024;
+
+/** How long close() waits for a peer to finish a graceful end() before destroying the socket. */
+const CLOSE_GRACE = 1000;
+
+/** An empty subscriber set, shared so a publish to a channel nobody listens on allocates nothing. */
+const NO_TARGETS = new Set();
+
+/** A request carried a malformed field; relayed to the caller as ERR with code EINVAL. */
+function invalid(message) {
+  const err = new Error(message);
+  err.code = 'EINVAL';
+  return err;
+}
 
 /**
  * The central broker. Holds the authoritative cache, routes pub/sub and RPC,
@@ -40,6 +62,11 @@ class Broker extends EventEmitter {
     // increasing offset so a reconnecting subscriber can resume from its last-seen one. Seeded from
     // persisted state (block-reserved) so offsets stay increasing across restarts.
     this.nextOffset = opts.offsetSeed || 0;
+    // Identifies this broker incarnation. With `offsetBase` (the offset counter at start) it lets a
+    // reconnecting client tell whether its last-seen offsets still mean anything here: an in-memory
+    // broker restarts its offsets at 0, and a stale high watermark would skip every new message.
+    this.epoch = crypto.randomBytes(8).toString('hex');
+    this.offsetBase = this.nextOffset;
     this.locks = new LockManager({ mintToken: () => this._mintToken() });
     this.token = opts.token || null;
     // Fallback deadline for an RPC call whose caller didn't send its own timeout (older clients).
@@ -96,9 +123,9 @@ class Broker extends EventEmitter {
     // trimmed in _retain when pubsub.retention is set.
     this.pubRetention = pubsubCfg.maxChannels > 0 ? new LRUCache({ max: pubsubCfg.maxChannels }) : new Map();
     if (this.pubsubPersist) {
-      // Recovered pub records aren't store state — route them to the retention ring, and re-append
-      // still-retained ones after an AOF rewrite so replay survives compaction.
-      this.persist.onPubRecord = (rec) => this._retain(rec.ch, rec.payload, rec.seq, rec.ts, rec.offset);
+      // Recovered pub records aren't store state — route them to the retention ring, and hand the
+      // still-retained ones to every snapshot so replay survives compaction.
+      this.persist.onPubRecord = (rec) => this._recoverPub(rec);
       this.persist.onCompactPubReplay = () => this._retainedRecords();
     }
 
@@ -129,6 +156,9 @@ class Broker extends EventEmitter {
 
     this.idleTimeout = opts.idleTimeout || 0; // ms; 0 = never auto-shutdown
     this._idleTimer = null;
+    this._retentionTimer = null; // prunes retentionMs-expired messages on idle channels
+    this._closePromise = null; // set once close() starts (idempotent)
+    this._listening = false; // true once WE own the socket (so close() only unlinks our own)
     this.heartbeatInterval = opts.heartbeatInterval == null ? 30000 : opts.heartbeatInterval;
     this._heartbeatTimer = null;
     this.server = null;
@@ -140,31 +170,68 @@ class Broker extends EventEmitter {
     await this.persist.load(this.store);
     this.nextToken = Math.max(this.nextToken, this.persist.loadedToken || 0);
     this.nextOffset = Math.max(this.nextOffset, this.persist.loadedOffset || 0);
+    // Any token at or below the seeded counter came from a previous incarnation whose per-key fence
+    // high-waters were lost with it, so reject them all (restart = every lock's TTL expired).
+    this.locks.fenceFloor = this.nextToken;
+    this.offsetBase = this.nextOffset;
     await this._listen();
+    this._listening = true;
     this._startHeartbeat();
     this._startStats();
+    this._startRetentionSweep();
     this.persist.start();
+    // Arm the idle timer now, not only after a disconnect: a broker spawned by a client that died
+    // before connecting would otherwise live forever.
+    this._scheduleIdle();
     return this;
   }
 
   async _listen() {
+    // Default POSIX sockets live in a private per-user dir: create it (0700) and refuse one that
+    // another user could have planted or can write into.
+    const privateSocket = isDefaultSocket(this.address);
+    if (privateSocket) assertPrivateDir(path.dirname(this.address), { create: true });
+    await this._bind();
+    if (privateSocket) {
+      try {
+        fs.chmodSync(this.address, 0o600);
+      } catch {
+        /* the 0700 dir already keeps other users out */
+      }
+    }
+  }
+
+  async _bind() {
     this.server = net.createServer((socket) => this._onConnection(socket));
     try {
       await this._tryListen();
     } catch (err) {
       if (err.code !== 'EADDRINUSE') throw err;
-      // Address in use: is a live broker already there, or is this a stale socket?
-      const alive = await this._probe();
-      if (alive) throw err; // genuine — caller should just connect instead
-      if (!isPipe(this.address)) {
+      if (isPipe(this.address)) {
+        // Named pipes leave no stale filesystem entry: in use means a live server owns it.
+        if (await this._probe()) throw err;
+        this.server = net.createServer((socket) => this._onConnection(socket));
+        await this._tryListen();
+        return;
+      }
+      // Address in use: a live broker, or a stale socket file? Probe + unlink + listen must be one
+      // critical section across processes. Otherwise two brokers racing on a stale socket can
+      // both probe "dead", and the slower one unlinks the faster one's LIVE socket — leaving two
+      // brokers with two separate caches (split brain).
+      const cleanupLock = `${this.address}.lock`;
+      if (!tryPidLock(cleanupLock)) throw err; // another broker is cleaning up / binding right now
+      try {
+        if (await this._probe()) throw err; // genuine — caller should just connect instead
         try {
           fs.unlinkSync(this.address);
         } catch {
           /* ignore */
         }
+        this.server = net.createServer((socket) => this._onConnection(socket));
+        await this._tryListen();
+      } finally {
+        releasePidLock(cleanupLock);
       }
-      this.server = net.createServer((socket) => this._onConnection(socket));
-      await this._tryListen();
     }
   }
 
@@ -203,6 +270,10 @@ class Broker extends EventEmitter {
       subs: new Set(),
       procs: new Set(),
     };
+    if (!conn.authed) {
+      const configured = this.peerOpts.maxFrameSize > 0 ? this.peerOpts.maxFrameSize : Infinity;
+      conn.peer.decoder.maxFrameSize = Math.min(PREAUTH_MAX_FRAME, configured);
+    }
     this.conns.set(conn.id, conn);
     this.emit('connect', conn.id);
     this._cancelIdle();
@@ -297,8 +368,13 @@ class Broker extends EventEmitter {
     if (seq > e.hi) {
       e.hi = seq;
       e.seen.add(seq);
-      const floor = e.hi - W;
-      for (const s of e.seen) if (s <= floor) e.seen.delete(s);
+      // Prune lazily, once the set holds 2W seqs: amortized O(1) per publish instead of an O(W)
+      // scan every time. Seqs below the window are never consulted (the range check below comes
+      // first), so letting them linger until the next prune is harmless.
+      if (e.seen.size > 2 * W) {
+        const floor = e.hi - W;
+        for (const s of e.seen) if (s <= floor) e.seen.delete(s);
+      }
       return false;
     }
     if (seq > e.hi - W) {
@@ -316,7 +392,9 @@ class Broker extends EventEmitter {
    */
   _fence(lockKey, token) {
     const high = this.locks.getFenceHigh(lockKey);
-    if (token == null || token < high) {
+    // Only a token this broker actually issued may pass. A non-integer would slip past `<` via
+    // coercion, and a never-issued huge value would raise the bar above every future real grant.
+    if (!Number.isSafeInteger(token) || token > this.nextToken || token < high) {
       const err = new Error(`fenced: token ${token} < ${high} for "${lockKey}"`);
       err.code = 'EFENCED';
       throw err;
@@ -325,6 +403,7 @@ class Broker extends EventEmitter {
   }
 
   _handle(conn, msg) {
+    if (msg === null || typeof msg !== 'object') return; // not a protocol frame (and no id to answer)
     const { t, id } = msg;
 
     // Handshake / auth gate: until a connection says HELLO with a valid token,
@@ -352,11 +431,20 @@ class Broker extends EventEmitter {
             return;
           }
           conn.authed = true;
+          conn.peer.decoder.maxFrameSize = this.peerOpts.maxFrameSize > 0 ? this.peerOpts.maxFrameSize : undefined;
           conn.name = msg.name || null;
           // Producer id for idempotent publishing: reuse the one the client presents (so dedup
           // survives a reconnect), else mint a fresh broker-unique one and hand it back.
           conn.pid = msg.pid || this._mintPid();
-          conn.peer.send({ t: TYPES.WELCOME, id, version: PROTOCOL_VERSION, broker: this.name, pid: conn.pid });
+          conn.peer.send({
+            t: TYPES.WELCOME,
+            id,
+            version: PROTOCOL_VERSION,
+            broker: this.name,
+            pid: conn.pid,
+            epoch: this.epoch,
+            offsetBase: this.offsetBase,
+          });
           break;
         case TYPES.PING:
           conn.peer.send({ t: TYPES.PONG, id });
@@ -405,13 +493,13 @@ class Broker extends EventEmitter {
 
         // ---- atomic ----
         case TYPES.INCR: {
-          const next = this.store.incr(msg.key, msg.by == null ? 1 : msg.by);
+          const next = this.store.incr(msg.key, amount(msg.by));
           this._logSet(msg.key, next, this.store.remainingTTL(msg.key)); // preserve any TTL
           this._ok(conn, id, next);
           break;
         }
         case TYPES.DECR: {
-          const next = this.store.incr(msg.key, -(msg.by == null ? 1 : msg.by));
+          const next = this.store.incr(msg.key, -amount(msg.by));
           this._logSet(msg.key, next, this.store.remainingTTL(msg.key)); // preserve any TTL
           this._ok(conn, id, next);
           break;
@@ -425,12 +513,15 @@ class Broker extends EventEmitter {
 
         // ---- locks ----
         case TYPES.LOCK:
-          this.locks
-            .acquire(msg.key, conn.id, { ttl: msg.ttl, wait: msg.wait })
-            .then((res) => this._ok(conn, id, res));
+          if (msg.ttl != null && !(Number.isFinite(msg.ttl) && msg.ttl > 0)) throw invalid('lock ttl must be a positive number');
+          if (msg.wait != null && !(Number.isFinite(msg.wait) && msg.wait >= 0)) throw invalid('lock wait must be a number >= 0');
+          this.locks.acquire(msg.key, conn.id, { ttl: msg.ttl, wait: msg.wait }).then(
+            (res) => this._ok(conn, id, res),
+            (err) => this._err(conn, id, err.message, err.code || 'EBROKER') // e.g. EFENCEEXHAUSTED
+          );
           break;
         case TYPES.UNLOCK:
-          this._ok(conn, id, this.locks.release(msg.key, conn.id));
+          this._ok(conn, id, this.locks.release(msg.key, conn.id, msg.token));
           break;
 
         // ---- fenced mutations (gated by a lock's fencing token) ----
@@ -454,6 +545,7 @@ class Broker extends EventEmitter {
 
         // ---- pub/sub ----
         case TYPES.SUBSCRIBE:
+          checkChannel(msg.channel);
           // Register FIRST, then replay — both synchronously with no await between them, so on this
           // single event loop no live PUBLISH can interleave. Replay thus covers up to the current
           // offset high-water; any later live message has a strictly higher offset (no overlap).
@@ -470,10 +562,13 @@ class Broker extends EventEmitter {
           this._ok(conn, id, { ok: true, offset: this.nextOffset });
           break;
         case TYPES.UNSUBSCRIBE:
+          checkChannel(msg.channel);
           this._unsubscribe(conn, msg.channel);
           this._ok(conn, id, true);
           break;
         case TYPES.PUBLISH: {
+          checkChannel(msg.channel);
+          if (msg.seq != null && !Number.isSafeInteger(msg.seq)) throw invalid('publish seq must be an integer');
           const acks = msg.acks == null ? 1 : msg.acks;
           const reply = acks !== 0; // acks:0 is fire-and-forget — the client isn't waiting
           // Idempotency: drop a retried publish (same producer id + channel + a seq we've already
@@ -501,18 +596,21 @@ class Broker extends EventEmitter {
 
         // ---- rpc ----
         case TYPES.REGISTER:
+          checkName(msg.name);
           this._register(conn, msg.name);
           this._ok(conn, id, true);
           break;
         case TYPES.UNREGISTER:
+          checkName(msg.name);
           this._unregister(conn, msg.name);
           this._ok(conn, id, true);
           break;
         case TYPES.CALL:
+          checkName(msg.name);
           this._call(conn, msg);
           break;
         case TYPES.RESULT:
-          this._result(msg);
+          this._result(conn, msg);
           break;
 
         default:
@@ -554,10 +652,14 @@ class Broker extends EventEmitter {
     const frame = offset === undefined ? { t: TYPES.MESSAGE, channel, payload } : { t: TYPES.MESSAGE, channel, payload, offset };
     // Collect target conns: exact subscribers + any matching wildcard patterns.
     // Dedupe so a conn subscribed both exactly and by pattern gets one copy.
-    const targets = new Set(this.channels.get(channel) || []);
+    // Only copy the exact set when patterns may add to it (sending never mutates the set
+    // synchronously: a disconnect is processed on a later tick).
+    const exact = this.channels.get(channel) || NO_TARGETS;
+    let targets = exact;
     if (this.patterns.size) {
       for (const [pattern, set] of this.patterns) {
         if (matchTopic(pattern, channel)) {
+          if (targets === exact) targets = new Set(exact);
           for (const cid of set) targets.add(cid);
         }
       }
@@ -595,19 +697,23 @@ class Broker extends EventEmitter {
   _persistPublish(msg, acks) {
     const ts = Date.now();
     const offset = this._mintOffset();
-    const rec = { op: 'pub', ch: msg.channel, payload: msg.payload, seq: msg.seq, ts, offset };
+    // Retain BEFORE logging: the append can trigger a compaction, whose snapshot must already
+    // include this message — otherwise truncating the AOF would erase the only durable copy.
+    this._retain(msg.channel, msg.payload, msg.seq, ts, offset, msg.pid);
     if (this.persist.enabled) {
+      // `pid` lets recovery rebuild idempotent-producer dedup, so a retry that lands after a
+      // restart is still recognized as a duplicate.
+      const rec = { op: 'pub', ch: msg.channel, payload: msg.payload, pid: msg.pid, seq: msg.seq, ts, offset };
       const rank = (a) => (a === 'all' ? 2 : a === 0 ? 0 : 1);
       const durable = this.durableAcks !== false && rank(acks) >= rank(this.durableAcks);
       if (durable) this.persist.logPublishSync(rec);
       else this.persist.logMutation(rec);
     }
-    this._retain(msg.channel, msg.payload, msg.seq, ts, offset);
     return offset;
   }
 
   /** Append a message to a channel's retention ring (for replay-on-subscribe). */
-  _retain(channel, payload, seq, ts = Date.now(), offset) {
+  _retain(channel, payload, seq, ts = Date.now(), offset, pid) {
     // retention:0 means "retain nothing" (replay disabled); unset means unlimited
     // (pubRetentionMax = Infinity, so the trim below never fires). See constructor.
     if (this.pubRetentionMax === 0) return;
@@ -616,7 +722,7 @@ class Broker extends EventEmitter {
       ring = [];
       this.pubRetention.set(channel, ring);
     }
-    ring.push({ payload, seq, ts, offset });
+    ring.push(pid == null ? { payload, seq, ts, offset } : { payload, seq, ts, offset, pid });
     if (this.pubRetentionMax > 0 && ring.length > this.pubRetentionMax) {
       ring.splice(0, ring.length - this.pubRetentionMax);
     }
@@ -627,11 +733,28 @@ class Broker extends EventEmitter {
     if (ring.length === 0) this.pubRetention.delete(channel);
   }
 
-  /** Flatten the retention rings back into pub records (used to survive an AOF rewrite). */
+  /**
+   * Retain a recovered pub record, skipping one already retained. A record can legitimately appear
+   * in both the snapshot and the AOF (queued before a compaction, written after it); offsets are
+   * strictly increasing per channel, so anything at or below the ring's tail is a repeat.
+   */
+  _recoverPub(rec) {
+    // Re-mark the producer's seq as seen (dedup isn't persisted on its own). Covers every message
+    // still retained; one already trimmed from retention can't be recognized after a restart.
+    if (this.dedup && rec.pid != null && rec.seq != null) {
+      this._dedupSeen(this._dedupEntry(`${rec.pid} ${rec.ch}`), rec.seq);
+    }
+    const ring = this.pubRetention.get(rec.ch);
+    const tail = ring && ring.length ? ring[ring.length - 1].offset : undefined;
+    if (rec.offset != null && tail != null && rec.offset <= tail) return;
+    this._retain(rec.ch, rec.payload, rec.seq, rec.ts, rec.offset, rec.pid);
+  }
+
+  /** Flatten the retention rings back into pub records (carried in every snapshot). */
   _retainedRecords() {
     const out = [];
     for (const [ch, ring] of this.pubRetention) {
-      for (const m of ring) out.push({ op: 'pub', ch, payload: m.payload, seq: m.seq, ts: m.ts, offset: m.offset });
+      for (const m of ring) out.push({ op: 'pub', ch, payload: m.payload, pid: m.pid, seq: m.seq, ts: m.ts, offset: m.offset });
     }
     return out;
   }
@@ -647,28 +770,61 @@ class Broker extends EventEmitter {
    */
   _replayTo(conn, channel, opts = {}) {
     if (this.pubRetention.size === 0) return;
-    // Gather matching (channel, message) pairs. Exact channels hit one ring; a wildcard pattern
-    // scans retained channels for prefix matches. (for..of over the LRU doesn't bump recency.)
-    const matches = [];
-    for (const [ch, ring] of this.pubRetention) {
-      if (!matchTopic(channel, ch)) continue;
-      for (const m of ring) matches.push({ ch, m });
+    const cutoff = this.pubRetentionMs > 0 ? Date.now() - this.pubRetentionMs : -Infinity;
+    // Gather matching (channel, message) pairs. Each ring is already in offset order.
+    let matches;
+    if (!isPattern(channel)) {
+      // Exact subscription: one ring, no scan of every retained channel and no sort.
+      const ring = this.pubRetention.get(channel);
+      if (!ring) return;
+      this._pruneRing(channel, ring, cutoff);
+      let from = 0;
+      if (typeof opts.since === 'number') from = firstAfter(ring, opts.since);
+      matches = [];
+      for (let i = from; i < ring.length; i++) matches.push({ ch: channel, m: ring[i] });
+    } else {
+      // Wildcard: merge the matching rings by offset (for..of over the LRU doesn't bump recency).
+      matches = [];
+      for (const [ch, ring] of [...this.pubRetention]) {
+        if (!matchTopic(channel, ch)) continue;
+        this._pruneRing(ch, ring, cutoff);
+        const from = typeof opts.since === 'number' ? firstAfter(ring, opts.since) : 0;
+        for (let i = from; i < ring.length; i++) matches.push({ ch, m: ring[i] });
+      }
+      // Canonical order is by offset (monotonic); fall back to ts for any pre-offset recovered record.
+      matches.sort((a, b) => (a.m.offset || 0) - (b.m.offset || 0) || a.m.ts - b.m.ts);
     }
     if (matches.length === 0) return;
-    // Canonical order is by offset (monotonic); fall back to ts for any pre-offset recovered record.
-    matches.sort((a, b) => (a.m.offset || 0) - (b.m.offset || 0) || a.m.ts - b.m.ts);
-    let selected;
-    if (typeof opts.since === 'number') {
-      selected = matches.filter(({ m }) => (m.offset || 0) > opts.since);
-    } else if (typeof opts.limit === 'number' && opts.limit > 0) {
+    let selected = matches;
+    if (typeof opts.since !== 'number' && typeof opts.limit === 'number' && opts.limit > 0) {
       selected = matches.slice(Math.max(0, matches.length - opts.limit));
-    } else {
-      selected = matches;
     }
     for (const { ch, m } of selected) {
       const frame = m.offset === undefined ? { t: TYPES.MESSAGE, channel: ch, payload: m.payload } : { t: TYPES.MESSAGE, channel: ch, payload: m.payload, offset: m.offset };
       if (conn.peer.send(frame, { droppable: false }) === 'overflow') return;
     }
+  }
+
+  /** Drop messages older than `cutoff` from the head of a ring (and the ring itself once empty). */
+  _pruneRing(channel, ring, cutoff) {
+    let n = 0;
+    while (n < ring.length && ring[n].ts < cutoff) n++;
+    if (n) ring.splice(0, n);
+    if (ring.length === 0) this.pubRetention.delete(channel);
+  }
+
+  /**
+   * retentionMs used to be enforced only when a channel received a new publish, so a channel that
+   * went quiet kept its expired messages forever. Sweep all rings periodically (unref'd).
+   */
+  _startRetentionSweep() {
+    if (!(this.pubRetentionMs > 0)) return;
+    const every = Math.min(Math.max(this.pubRetentionMs, 1000), 60000);
+    this._retentionTimer = setInterval(() => {
+      const cutoff = Date.now() - this.pubRetentionMs;
+      for (const [ch, ring] of [...this.pubRetention]) this._pruneRing(ch, ring, cutoff);
+    }, every);
+    if (this._retentionTimer.unref) this._retentionTimer.unref();
   }
 
   // ----------------------------------------------------------------------- rpc
@@ -761,9 +917,11 @@ class Broker extends EventEmitter {
     if (cur != null) entry.inflight.set(ownerConnId, Math.max(0, cur - 1));
   }
 
-  _result(msg) {
+  _result(conn, msg) {
     const p = this.pending.get(msg.id);
-    if (!p) return;
+    // Only the worker the call was dispatched to may settle it. Call ids are sequential, so
+    // without this any connection could forge (or, after a reconnect, misroute) another's reply.
+    if (!p || p.ownerConnId !== conn.id) return;
     this.pending.delete(msg.id);
     clearTimeout(p.timer);
     this._decInflight(p.name, p.ownerConnId);
@@ -872,7 +1030,7 @@ class Broker extends EventEmitter {
   }
 
   _scheduleIdle() {
-    if (!this.idleTimeout || this.conns.size > 0) return;
+    if (this._closePromise || !this.idleTimeout || this.conns.size > 0) return;
     this._cancelIdle();
     this._idleTimer = setTimeout(() => this.close(), this.idleTimeout);
     if (this._idleTimer.unref) this._idleTimer.unref();
@@ -885,30 +1043,74 @@ class Broker extends EventEmitter {
     }
   }
 
-  async close() {
+  /**
+   * Shut down. Idempotent (SHUTDOWN, SIGTERM and the idle timer can all race here). Order matters:
+   * stop accepting, let connections finish gracefully (so a queued reply such as SHUTDOWN's OK is
+   * flushed rather than discarded by destroy), THEN flush persistence — so no mutation can be
+   * applied after the final snapshot.
+   */
+  close() {
+    if (!this._closePromise) this._closePromise = this._close();
+    return this._closePromise;
+  }
+
+  async _close() {
     this._cancelIdle();
-    if (this._heartbeatTimer) {
-      clearInterval(this._heartbeatTimer);
-      this._heartbeatTimer = null;
+    for (const t of ['_heartbeatTimer', '_statsTimer', '_retentionTimer']) {
+      if (this[t]) {
+        clearInterval(this[t]);
+        this[t] = null;
+      }
     }
-    if (this._statsTimer) {
-      clearInterval(this._statsTimer);
-      this._statsTimer = null;
+    const serverClosed = this.server
+      ? new Promise((resolve) => this.server.close(() => resolve()))
+      : Promise.resolve();
+    for (const c of this.conns.values()) {
+      c.peer.end();
+      const force = setTimeout(() => c.peer.destroy(), CLOSE_GRACE);
+      if (force.unref) force.unref();
     }
-    for (const c of this.conns.values()) c.peer.destroy();
+    await serverClosed; // resolves once every connection has closed
     this.conns.clear();
     await this.persist.flushAndClose(); // final snapshot + fsync → planned restart is lossless
-    if (this.server) {
-      await new Promise((resolve) => this.server.close(() => resolve()));
-    }
-    if (!isPipe(this.address)) {
+    this.store.close();
+    // Unlink only a socket we bound: after a failed start, the file belongs to another broker.
+    if (this._listening && !isPipe(this.address)) {
       try {
         fs.unlinkSync(this.address);
       } catch {
         /* ignore */
       }
     }
+    this._listening = false;
   }
+}
+
+/** The `by` of an incr/decr: 1 if omitted, else it must be a finite number. */
+function amount(by) {
+  if (by == null) return 1;
+  if (typeof by !== 'number' || !Number.isFinite(by)) throw invalid('incr/decr "by" must be a finite number');
+  return by;
+}
+
+function checkChannel(channel) {
+  if (typeof channel !== 'string') throw invalid('channel must be a string');
+}
+
+function checkName(name) {
+  if (typeof name !== 'string') throw invalid('procedure name must be a string');
+}
+
+/** First index in an offset-ordered ring whose offset is > `since` (binary search). */
+function firstAfter(ring, since) {
+  let lo = 0;
+  let hi = ring.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if ((ring[mid].offset || 0) > since) hi = mid;
+    else lo = mid + 1;
+  }
+  return lo;
 }
 
 /** Monotonic-ish clock; avoids Date dependency on the hot path. */

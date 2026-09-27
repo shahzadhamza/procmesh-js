@@ -231,3 +231,50 @@ test('maxFrameSize is plumbed to the client peer and enforced broker-side', asyn
     await b.close();
   }
 });
+
+test('unbounded store purges expired TTL entries that are never touched again', async () => {
+  const s = new Store({});
+  for (let i = 0; i < 500; i++) s.set(`sess${i}`, i, 30);
+  s.set('forever', 1);
+  assert.strictEqual(s.size, 501);
+  await delay(600); // > ttl + a couple of sweep ticks
+  assert.strictEqual(s.size, 1, 'expired entries swept without being read');
+  assert.strictEqual(s.cache.ttlCount, 0);
+  assert.strictEqual(s.cache._sweepTimer, null, 'sweep stops once no TTL entries remain');
+  assert.strictEqual(s.get('forever'), 1);
+  s.close();
+});
+
+test('FrameDecoder decodes a large frame split into many chunks in linear time', () => {
+  const { encodeFrame } = require('../src/protocol');
+  const big = 'x'.repeat(32 * 1024 * 1024);
+  const frame = encodeFrame(jsonCodec, { big });
+  const dec = new FrameDecoder(jsonCodec);
+  const out = [];
+  const started = Date.now();
+  for (let i = 0; i < frame.length; i += 16 * 1024) dec.push(frame.subarray(i, i + 16 * 1024), (m) => out.push(m));
+  assert.strictEqual(out.length, 1);
+  assert.strictEqual(out[0].big.length, big.length);
+  // The old concat-per-chunk decoder copied ~32GB here; linear decoding is well under a second.
+  assert.ok(Date.now() - started < 3000, `took ${Date.now() - started}ms`);
+});
+
+test('FrameDecoder handles headers and frames straddling 1-byte chunks', () => {
+  const { encodeFrame } = require('../src/protocol');
+  const frames = Buffer.concat([1, 2, 3].map((n) => encodeFrame(jsonCodec, { n })));
+  const dec = new FrameDecoder(jsonCodec);
+  const out = [];
+  for (let i = 0; i < frames.length; i++) dec.push(frames.subarray(i, i + 1), (m) => out.push(m.n));
+  assert.deepStrictEqual(out, [1, 2, 3]);
+  assert.strictEqual(dec.length, 0);
+});
+
+test('CAS equality ignores key order and distinguishes Maps', () => {
+  const s = new Store({});
+  s.set('o', { a: 1, b: { c: [1, 2] } });
+  assert.strictEqual(s.cas('o', { b: { c: [1, 2] }, a: 1 }, 'next'), true, 'key order is irrelevant');
+  s.set('m', new Map([['k', 1]]));
+  assert.strictEqual(s.cas('m', new Map([['k', 2]]), 'bad'), false, 'different Maps are not equal');
+  assert.strictEqual(s.cas('m', new Map([['k', 1]]), 'good'), true);
+  assert.strictEqual(s.cas('missing', null, 'created'), true, 'absent still matches null');
+});

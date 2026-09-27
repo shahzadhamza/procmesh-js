@@ -52,6 +52,9 @@ class Client extends EventEmitter {
     this.closed = false;
     this.nextId = 1;
     this.pending = new Map(); // id -> { resolve, reject, timer, t }
+    // Timed-out requests whose reply still matters if it arrives late: id -> (value) => void.
+    // Used by lock(): a grant that lands after we gave up must be released, not held until TTL.
+    this._late = new Map();
     this.subscriptions = new Map(); // channel -> Set<handler>
     this.handlers = new Map(); // procName -> fn
 
@@ -84,6 +87,8 @@ class Client extends EventEmitter {
     // subscribe() issued while disconnected still ask for its backlog once the link comes up
     // (`_replay`). Cleared once a `since` watermark exists (reconnect resumes by offset instead).
     this._replayOpts = new Map();
+    // Broker incarnation we last handshook with (see WELCOME.epoch); null until the first connect.
+    this._epoch = null;
 
     this._connectPromise = null;
     this._reconnectAttempt = 0;
@@ -134,22 +139,34 @@ class Client extends EventEmitter {
       socket.once('error', onError);
       socket.once('connect', async () => {
         socket.removeListener('error', onError);
-        this.peer = new Peer(socket, this.codec, {
+        if (this.closed) {
+          // close() ran while we were connecting: don't resurrect a live link behind its back.
+          socket.destroy();
+          reject(new errors.Disconnected('client is closed'));
+          return;
+        }
+        const peer = new Peer(socket, this.codec, {
           maxFrameSize: this.opts.maxFrameSize,
           sendHighWaterMark: this.opts.sendHighWaterMark,
           sendHardLimit: this.opts.sendHardLimit,
         });
+        this.peer = peer;
         this.connected = true;
         this._reconnectAttempt = 0;
-        this.peer.on('message', (msg) => this._onMessage(msg));
-        this.peer.on('close', () => this._onClose());
-        this.peer.on('error', () => {
+        peer.on('message', (msg) => this._onMessage(msg));
+        // Only the CURRENT peer's close tears down client state: a superseded socket closing late
+        // must not null out (and reject the requests of) the link that replaced it.
+        peer.on('close', () => {
+          if (this.peer === peer) this._onClose();
+        });
+        peer.on('error', () => {
           /* 'close' handles it */
         });
         try {
           // Re-present our producer id (if any) so idempotent dedup survives a reconnect.
           const welcome = await this._request(TYPES.HELLO, { name: this.name, token: this.token, pid: this.pid });
           if (welcome && welcome.pid) this.pid = welcome.pid;
+          if (welcome && welcome.epoch) this._adoptEpoch(welcome.epoch, welcome.offsetBase);
           await this._replay();
           this._startKeepalive();
           this.emit('connect');
@@ -157,6 +174,16 @@ class Client extends EventEmitter {
         } catch (err) {
           // A rejected auth is fatal — don't loop reconnecting with a bad token.
           if (err && err.code === 'EAUTH') this.reconnectEnabled = false;
+          // A failed handshake (HELLO timeout, a failed resubscribe) must not leave a half-set-up
+          // link marked connected: the next attempt would open a second socket alongside it.
+          // Detach first so this peer's close is ignored, then fail whatever was sent on it.
+          if (this.peer === peer) {
+            this.peer = null;
+            this.connected = false;
+            this._stopKeepalive();
+            this._failPending(new errors.Disconnected('handshake with broker failed'));
+          }
+          peer.destroy();
           reject(err);
         }
       });
@@ -186,6 +213,9 @@ class Client extends EventEmitter {
       stdio: 'ignore',
       env: { ...process.env, PROCMESH_BROKER_OPTS: JSON.stringify(brokerOpts) },
     });
+    // An unhandled ChildProcess 'error' (EAGAIN/EMFILE/…) would crash THIS process. Report it;
+    // the connect loop then fails normally with the underlying connect error.
+    child.on('error', (err) => this._emitError(err));
     child.unref();
   }
 
@@ -208,6 +238,22 @@ class Client extends EventEmitter {
     }
     for (const name of this.handlers.keys()) {
       await this._request(TYPES.REGISTER, { name });
+    }
+  }
+
+  /**
+   * On reconnecting to a DIFFERENT broker incarnation, any watermark above that broker's starting
+   * offset belongs to a lost offset space (an in-memory broker restarted from 0). Kept, it would make
+   * `_deliver` skip every new message until offsets caught up — silent loss. Rebase such watermarks
+   * to `offsetBase`, so `_replay` asks for everything the new broker retained. A persisted broker
+   * seeds `offsetBase` above every old offset, so its watermarks are left alone.
+   */
+  _adoptEpoch(epoch, offsetBase) {
+    const prev = this._epoch;
+    this._epoch = epoch;
+    if (prev == null || prev === epoch || typeof offsetBase !== 'number') return;
+    for (const [sub, seen] of this._offsets) {
+      if (seen > offsetBase) this._offsets.set(sub, offsetBase);
     }
   }
 
@@ -248,14 +294,19 @@ class Client extends EventEmitter {
     this.connected = false;
     this.peer = null;
     this._stopKeepalive();
-    const err = new errors.Disconnected('connection to broker lost');
+    this._failPending(new errors.Disconnected('connection to broker lost'));
+    this._late.clear(); // the broker drops a closed connection's locks itself
+    this.emit('disconnect');
+    if (!this.closed && this.reconnectEnabled) this._scheduleReconnect();
+  }
+
+  /** Reject every in-flight request (their link is gone). */
+  _failPending(err) {
     for (const p of this.pending.values()) {
       clearTimeout(p.timer);
       p.reject(err);
     }
     this.pending.clear();
-    this.emit('disconnect');
-    if (!this.closed && this.reconnectEnabled) this._scheduleReconnect();
   }
 
   _scheduleReconnect() {
@@ -279,7 +330,7 @@ class Client extends EventEmitter {
 
   // ------------------------------------------------------------------ messaging
 
-  _request(t, payload = {}, timeout = this.callTimeout) {
+  _request(t, payload = {}, timeout = this.callTimeout, { onLate } = {}) {
     return new Promise((resolve, reject) => {
       if (!this.peer || !this.connected) {
         reject(new errors.Disconnected());
@@ -288,12 +339,27 @@ class Client extends EventEmitter {
       const id = this.nextId++;
       const timer = setTimeout(() => {
         this.pending.delete(id);
+        if (onLate) this._expectLate(id, onLate, timeout);
         reject(new errors.CallTimeout(`request "${t}" timed out after ${timeout}ms`));
       }, timeout);
       if (timer.unref) timer.unref();
       this.pending.set(id, { resolve, reject, timer, t });
-      this.peer.send({ t, id, ...payload });
+      try {
+        this.peer.send({ t, id, ...payload });
+      } catch (err) {
+        // Unencodable payload (e.g. a BigInt under JSON): fail now, don't leak the entry + timer.
+        clearTimeout(timer);
+        this.pending.delete(id);
+        reject(err);
+      }
     });
+  }
+
+  /** Remember a timed-out request's late-reply handler for a while (see `_late`). */
+  _expectLate(id, onLate, timeout) {
+    this._late.set(id, onLate);
+    const forget = setTimeout(() => this._late.delete(id), Math.max(timeout, 30000));
+    if (forget.unref) forget.unref();
   }
 
   _settle(id, fn) {
@@ -307,6 +373,12 @@ class Client extends EventEmitter {
   _onMessage(msg) {
     switch (msg.t) {
       case TYPES.OK:
+        if (!this.pending.has(msg.id) && this._late.has(msg.id)) {
+          const onLate = this._late.get(msg.id);
+          this._late.delete(msg.id);
+          onLate(msg.value);
+          break;
+        }
         this._settle(msg.id, (p) => p.resolve(msg.value));
         break;
       case TYPES.WELCOME:
@@ -314,7 +386,9 @@ class Client extends EventEmitter {
         this._settle(msg.id, (p) => p.resolve(msg.t === TYPES.PONG ? true : msg));
         break;
       case TYPES.ERR:
-        this._settle(msg.id, (p) => p.reject(new errors.RemoteError(msg.message, msg.code)));
+        this._settle(msg.id, (p) =>
+          p.reject(msg.code === 'EFENCED' ? new errors.Fenced(msg.message) : new errors.RemoteError(msg.message, msg.code))
+        );
         break;
       case TYPES.MESSAGE:
         this._deliver(msg.channel, msg.payload, msg.offset);
@@ -355,33 +429,49 @@ class Client extends EventEmitter {
         const r = h(payload, channel);
         // An async handler that rejects would otherwise escape as an unhandledRejection; route it
         // to 'error' just like a synchronous throw (caught below).
-        if (r && typeof r.then === 'function') r.then(undefined, (err) => this.emit('error', err));
+        if (r && typeof r.then === 'function') r.then(undefined, (err) => this._emitError(err));
       } catch (err) {
-        this.emit('error', err);
+        this._emitError(err);
       }
     }
   }
 
+  /**
+   * Report a subscriber-handler failure. EventEmitter THROWS on an 'error' with no listener, which
+   * here would escape into the socket read path (or an unhandled rejection for async handlers), so
+   * fall back to a process warning when nobody is listening.
+   */
+  _emitError(err) {
+    if (this.listenerCount('error') > 0) this.emit('error', err);
+    else process.emitWarning(err instanceof Error ? err : new Error(String(err)), 'ProcMeshWarning');
+  }
+
   async _onInvoke(msg) {
+    // Reply on the link the call ARRIVED on. The call id is only meaningful to that broker
+    // session: if we reconnected (possibly to a restarted broker) while the handler ran, sending
+    // it on the new link could settle an unrelated call that happens to reuse the id.
+    const peer = this.peer;
+    const reply = (frame) => {
+      if (peer && this.peer === peer) peer.send(frame);
+    };
     const fn = this.handlers.get(msg.name);
     if (!fn) {
-      this.peer.send({
-        t: TYPES.RESULT,
-        id: msg.id,
-        error: { message: `no handler "${msg.name}"`, code: 'ENOHANDLER' },
-      });
+      reply({ t: TYPES.RESULT, id: msg.id, error: { message: `no handler "${msg.name}"`, code: 'ENOHANDLER' } });
       return;
     }
     try {
       const result = await fn(...(msg.args || []));
-      if (this.peer) this.peer.send({ t: TYPES.RESULT, id: msg.id, result });
+      reply({ t: TYPES.RESULT, id: msg.id, result });
     } catch (err) {
-      if (this.peer) {
-        this.peer.send({
-          t: TYPES.RESULT,
-          id: msg.id,
-          error: { message: err.message, code: err.code || 'EHANDLER' },
-        });
+      // Handlers may throw anything (`throw null`, a string, reject()): never assume an Error,
+      // or reading `.message` here would itself throw and crash the worker.
+      const isObj = err != null && typeof err === 'object';
+      const message = isObj && err.message != null ? String(err.message) : String(err);
+      const code = (isObj && err.code) || 'EHANDLER';
+      try {
+        reply({ t: TYPES.RESULT, id: msg.id, error: { message, code } });
+      } catch {
+        /* link unusable — the broker fails the call when it notices */
       }
     }
   }
@@ -533,7 +623,10 @@ class Client extends EventEmitter {
         // below. Refreshing here keeps the stable seq while picking up the real pid, so the broker
         // actually dedupes retries instead of skipping dedup on a null pid (double-delivery).
         frame.pid = this.pid;
-        return await this._request(TYPES.PUBLISH, frame, remaining);
+        // Split the budget across the attempts still allowed (the last one gets all that's left).
+        // Giving the first attempt the whole deadline meant a timeout left no time to retry at all.
+        const perAttempt = attempt >= retries ? remaining : Math.ceil(remaining / (retries - attempt + 1));
+        return await this._request(TYPES.PUBLISH, frame, perAttempt);
       } catch (err) {
         const retriable = err.code === 'ETIMEOUT' || err.code === 'EDISCONNECTED';
         if (!retriable || attempt >= retries) throw err;
@@ -632,7 +725,14 @@ class Client extends EventEmitter {
     const ttl = opts.ttl == null ? 30000 : opts.ttl;
     const wait = opts.wait == null ? 0 : opts.wait;
     const requestTimeout = wait > 0 ? wait + 5000 : this.callTimeout;
-    const reply = await this._request(TYPES.LOCK, { key, ttl, wait }, requestTimeout);
+    // If the grant arrives after we time out, nobody will ever call release(): hand it straight back.
+    const onLate = (late) => {
+      if (late && late.acquired === true) {
+        const unlock = late.token == null ? { key } : { key, token: late.token };
+        this._request(TYPES.UNLOCK, unlock).catch(() => {});
+      }
+    };
+    const reply = await this._request(TYPES.LOCK, { key, ttl, wait }, requestTimeout, { onLate });
     // Tolerate the legacy boolean reply shape (pre-v2 broker) as well as { acquired, token }.
     const acquired = reply === true || (reply && reply.acquired === true);
     const token = reply && reply.token != null ? reply.token : null;
@@ -642,7 +742,9 @@ class Client extends EventEmitter {
       if (released) return;
       released = true;
       try {
-        await this._request(TYPES.UNLOCK, { key });
+        // Scope the release to THIS grant, so a stale release (after a TTL overrun re-granted the
+        // lock to another task on the same connection) can't free someone else's lock.
+        await this._request(TYPES.UNLOCK, token == null ? { key } : { key, token });
       } catch {
         /* broker gone — lock expires via TTL */
       }

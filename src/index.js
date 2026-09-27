@@ -2,6 +2,8 @@
 
 const Client = require('./client');
 const ShardedClient = require('./sharded-client');
+
+const { resolveShardSpecs } = ShardedClient;
 const Broker = require('./broker');
 const errors = require('./errors');
 const { resolveAddress } = require('./transport');
@@ -28,7 +30,16 @@ function isSharded(opts) {
  *        (auto-spawns brokers named `${name}#0..#N-1`) or an array of names/{name,address} specs
  */
 async function createClient(opts = {}) {
-  const client = isSharded(opts) ? new ShardedClient(opts) : new Client(opts);
+  let client;
+  if (isSharded(opts)) {
+    client = new ShardedClient(opts);
+  } else if (Array.isArray(opts.shards) && opts.shards.length === 1) {
+    // A one-element shard list is a plain client — but for THAT shard, not the default address.
+    const [spec] = resolveShardSpecs(opts, opts.name || 'default');
+    client = new Client({ ...opts, shards: undefined, name: spec.name || opts.name, address: spec.address });
+  } else {
+    client = new Client(opts);
+  }
   await client.connect();
   return client;
 }

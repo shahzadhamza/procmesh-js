@@ -202,6 +202,11 @@ await mesh.withLock('job:42', async () => { /* critical section */ });
 `ttl` auto-releases the lock if the holder crashes, preventing deadlocks. A holder's
 locks are also released automatically when it disconnects.
 
+Locks are owned by the **connection**, so two async tasks sharing one client contend normally: the
+second queues until the first releases. For the same reason locks are **not re-entrant**. A task that
+re-acquires a lock it already holds queues behind itself until the TTL expires. A `release()` only
+frees its own grant, so a late release after a TTL overrun can't free the next holder's lock.
+
 ## Advanced
 
 ### Fencing tokens (safe under TTL overrun)
@@ -213,15 +218,19 @@ write from a holder whose lock already expired is rejected with `EFENCED`.
 
 ```js
 // withLock hands you a fenced context — set/cas/del here are guarded by this grant's token:
-await mesh.withLock('account:42', async ({ token, set, cas }) => {
-  await set('account:42:balance', 100);   // rejected with EFENCED if our lock has expired
+await mesh.withLock('{account:42}', async ({ token, set, cas }) => {
+  await set('{account:42}:balance', 100);   // rejected with EFENCED if our lock has expired
 });
 
 // manual: the release closure carries the token
-const release = await mesh.lock('account:42', { ttl: 30_000 });
-await mesh.fencedSet('account:42', release.token, 'account:42:balance', 100);
+const release = await mesh.lock('{account:42}', { ttl: 30_000 });
+await mesh.fencedSet('{account:42}', release.token, '{account:42}:balance', 100);
 await release();
 ```
+
+(The `{…}` hash tag only matters when sharding: it keeps the lock and the data it guards on the same
+broker. See [Sharding](#sharding-scale-past-one-core).) A broker restart counts as every lock
+expiring: tokens issued before the restart are rejected, so re-acquire after reconnecting.
 
 **Limitation:** procmesh can only *enforce* fencing for state kept in its own store. If your
 critical section writes to an external resource (DB row, file, API), that resource must check
@@ -245,7 +254,9 @@ const mesh = await createClient({
 await mesh.set('user:1', { name: 'Ada' });   // same API, transparently routed
 ```
 
-**How work is routed.** Every key/name/channel hashes (FNV-1a, mod N) to exactly one broker:
+**How work is routed.** Every key/name/channel hashes (FNV-1a, mod N) to exactly one broker. As
+in Redis Cluster, if a key contains a `{…}` **hash tag** with a non-empty body, only the body is
+hashed, so `{user:1}:profile` and `{user:1}:cart` are guaranteed to share a broker:
 
 | Primitive                         | Routes by      | Scales across cores?                          |
 |-----------------------------------|----------------|-----------------------------------------------|
@@ -264,10 +275,10 @@ and the same per-shard naming/addresses, or a given key hashes to different brok
 (writer/reader split-brain). Pin `shards` in shared config. (Numeric `shards` is incompatible with
 `PROCMESH_SOCKET`, which would collapse every shard onto one socket — that throws.)
 
-**Lock/data colocation gotcha.** Inside `withLock(L, fn)`, `ctx.set(k, …)` writes to **`L`'s** shard
-(fencing is per-broker), *not* `k`'s shard. So a fenced write may not be visible via `mesh.get(k)`
-when `k` and `L` hash differently. Keep them colocated: use the same string for the lock and the
-guarded key, or namespace guarded keys under the lock key.
+**Lock/data colocation.** Inside `withLock(L, fn)`, `ctx.set(k, …)` writes to **`L`'s** shard
+(fencing is per-broker), *not* `k`'s shard. So a fenced write is invisible to `mesh.get(k)` when `k`
+and `L` hash differently. A shared *prefix* is not enough (the whole string is hashed). Colocate
+them with a hash tag instead: lock `{account:42}` and guard `{account:42}:balance`.
 
 **Events & stats.** The sharded handle emits `connect` once **all** shards are up and `disconnect`
 once **all** are down, plus per-shard `shard-reconnect(i)` / `shard-disconnect(i)` (a forwarded
@@ -323,6 +334,7 @@ npx procmesh serve            # foreground broker
 npx procmesh status           # is a broker up?
 npx procmesh stop             # ask it to shut down
 # all accept [--name <name>] [--socket <addr>] [--token <secret>]
+# prefer PROCMESH_TOKEN=<secret> over --token: argv is visible to every local user via `ps`
 ```
 
 ### Observability
@@ -429,7 +441,11 @@ node app-a   node app-b   node worker
    cache · pub/sub · rpc router · lock manager
 ```
 
-- **Transport:** Node's built-in `net` only — zero native dependencies.
+- **Transport:** Node's built-in `net` only — zero native dependencies. On POSIX the default socket
+  is `<tmpdir>/procmesh-<uid>/procmesh-<name>.sock`, in a per-user directory created with mode
+  0700. The socket is chmod 0600, and broker and client both refuse the directory (`EUNSAFEDIR`) if
+  it's a symlink, owned by another user, or group/world-writable. The default persist dir gets
+  the same ownership check. On Windows it is the named pipe `\\.\pipe\procmesh-<name>`.
 - **Framing:** 4-byte length-prefixed frames; JSON payloads by default.
 - **Eviction/TTL:** backed by [`lru-cache`](https://www.npmjs.com/package/lru-cache) when cache
   bounds are configured; unbounded by default.
@@ -439,6 +455,7 @@ node app-a   node app-b   node worker
 
 ## Limitations (v1)
 
+- **Requires Node.js 20+** (the `lru-cache` dependency no longer supports Node 18).
 - **Same machine only.** No cross-host networking (use Redis/NATS for that).
 - **Single broker = single core.** All ops serialize through one event loop; that's what makes
   cache/atomic/locks correct by construction, but it caps throughput at one core (≈100k small

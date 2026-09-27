@@ -37,6 +37,7 @@ function usage() {
   console.log(`procmesh — shared in-memory cache & IPC for Node processes
 
 Options: [--name <name>] [--socket <addr>] [--token <secret>]
+  (set PROCMESH_TOKEN instead of --token to keep the secret out of the process list)
 
 Usage:
   procmesh serve     run a foreground broker
@@ -56,6 +57,8 @@ serve pub/sub options:
 async function main() {
   const [cmd, ...rest] = process.argv.slice(2);
   const args = parseArgs(rest);
+  // Prefer PROCMESH_TOKEN over --token: argv is visible to every local user via `ps`.
+  if (args.token == null && process.env.PROCMESH_TOKEN) args.token = process.env.PROCMESH_TOKEN;
 
   switch (cmd) {
     case 'serve': {
@@ -106,10 +109,9 @@ async function main() {
       const client = new Client({ name: args.name, address: args.socket, token: args.token, autoSpawn: false, reconnect: false });
       try {
         await client.connect();
-        await client.ping();
-        const keys = await client.keys();
+        const { cacheSize } = await client.stats(); // a count, not a transfer of every key
         // eslint-disable-next-line no-console
-        console.log(`broker UP at ${client.address} — ${keys.length} key(s) cached`);
+        console.log(`broker UP at ${client.address} — ${cacheSize} key(s) cached`);
         await client.close();
       } catch (err) {
         // eslint-disable-next-line no-console

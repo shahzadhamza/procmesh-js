@@ -97,3 +97,61 @@ test('multiple subscribers all receive a message', async () => {
     await sub2.close();
   }
 });
+
+test('a subscriber keeps receiving after an in-memory broker restart resets offsets', async () => {
+  const { createBroker, createClient } = require('../src');
+  const { uniqueName, once } = require('./helpers');
+  const name = uniqueName();
+  const opts = { name, idleTimeout: 0, pubsub: { persist: true } }; // retention on, no persist dir
+  let b1 = await createBroker(opts).start();
+  const s = await createClient({ address: b1.address, autoSpawn: false, reconnect: true });
+  const got = [];
+  await s.subscribe('restart-ch', (m) => got.push(m));
+  const p1 = await createClient({ address: b1.address, autoSpawn: false, reconnect: false });
+  for (let i = 1; i <= 3; i++) await p1.publish('restart-ch', `old${i}`);
+  await p1.close();
+  await delay(30);
+  assert.deepStrictEqual(got, ['old1', 'old2', 'old3']);
+
+  const reconnected = once(s, 'reconnect');
+  await b1.close();
+  const b2 = await createBroker(opts).start(); // same address, offsets start at 0 again
+  try {
+    await reconnected;
+    const p2 = await createClient({ address: b2.address, autoSpawn: false, reconnect: false });
+    await p2.publish('restart-ch', 'new1');
+    await p2.close();
+    await delay(50);
+    assert.deepStrictEqual(got, ['old1', 'old2', 'old3', 'new1'], 'post-restart message not skipped');
+  } finally {
+    await s.close();
+    await b2.close();
+  }
+});
+
+test('a throwing subscriber handler does not drop the connection or later messages', async () => {
+  const warnings = [];
+  const onWarn = (w) => warnings.push(w);
+  process.on('warning', onWarn);
+  const c = await client(broker);
+  const got = [];
+  try {
+    await c.subscribe('boom', () => {
+      throw new Error('handler bug');
+    });
+    await c.subscribe('boom-async', async () => {
+      throw new Error('async handler bug');
+    });
+    await c.subscribe('fine', (m) => got.push(m));
+    await pub.publish('boom', 1);
+    await pub.publish('boom-async', 1);
+    await pub.publish('fine', 'still-here');
+    await delay(50);
+    assert.ok(c.connected, 'connection survived the throwing handlers');
+    assert.deepStrictEqual(got, ['still-here']);
+    assert.ok(warnings.some((w) => /handler bug/.test(w.message)), 'failure surfaced as a warning');
+  } finally {
+    process.removeListener('warning', onWarn);
+    await c.close();
+  }
+});

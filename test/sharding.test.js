@@ -431,3 +431,36 @@ test('createClient returns a plain Client for shards<=1 and a ShardedClient for 
     await sharded.close();
   }
 });
+
+test('hash tags colocate keys that share a {tag}', () => {
+  const { hashSlotKey } = require('../src/hashring');
+  for (const n of [2, 3, 7, 16]) {
+    assert.strictEqual(shardIndex('{account:42}:balance', n), shardIndex('{account:42}', n));
+    assert.strictEqual(shardIndex('{account:42}:balance', n), shardIndex('account:42', n));
+  }
+  assert.strictEqual(hashSlotKey('no-tag'), 'no-tag');
+  assert.strictEqual(hashSlotKey('empty{}tag'), 'empty{}tag', 'an empty tag hashes the whole key');
+  assert.strictEqual(hashSlotKey('a{b}c{d}'), 'b', 'the first tag wins');
+});
+
+test('a one-element shards list connects to THAT shard', async () => {
+  const single = await createClient({ shards: [{ address: brokers[1].address }], autoSpawn: false, reconnect: false });
+  const direct = await client(brokers[1]);
+  try {
+    await single.set('only-shard', 'here');
+    assert.strictEqual(await direct.get('only-shard'), 'here');
+  } finally {
+    await single.close();
+    await direct.close();
+  }
+});
+
+test('sharded clear()/mset() resolve true like a plain Client', async () => {
+  const mesh = await makeMesh();
+  try {
+    assert.strictEqual(await mesh.mset({ a1: 1, b2: 2 }), true);
+    assert.strictEqual(await mesh.clear(), true);
+  } finally {
+    await mesh.close();
+  }
+});

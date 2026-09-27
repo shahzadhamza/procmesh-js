@@ -77,7 +77,9 @@ class ShardedClient extends EventEmitter {
   _wireChild(child, i) {
     child.on('error', (err) => {
       if (err && typeof err === 'object') err.shard = i;
-      this.emit('error', err);
+      // Same no-listener guard as Client._emitError: an unhandled 'error' emit would throw.
+      if (this.listenerCount('error') > 0) this.emit('error', err);
+      else process.emitWarning(err instanceof Error ? err : new Error(String(err)), 'ProcMeshWarning');
     });
     child.on('connect', () => this._onChildState());
     child.on('reconnect', () => {
@@ -86,6 +88,7 @@ class ShardedClient extends EventEmitter {
     });
     child.on('disconnect', () => {
       this.emit('shard-disconnect', i);
+      this._allUp = false; // so 'connect' fires again once every shard is back
       if (this.clients.every((c) => !c.connected)) this.emit('disconnect');
     });
   }
@@ -137,6 +140,7 @@ class ShardedClient extends EventEmitter {
 
   async clear() {
     await this._fanOut((c) => c.clear());
+    return true; // same shape as Client.clear()
   }
 
   /** Split keys per shard, fan out, recombine aligned to input order (undefined for misses). */
@@ -162,6 +166,7 @@ class ShardedClient extends EventEmitter {
     const buckets = this.clients.map(() => []);
     for (const entry of list) buckets[shardIndex(entry[0], this.n)].push(entry);
     await Promise.all(buckets.map((bucket, s) => (bucket.length ? this.clients[s].mset(bucket) : null)));
+    return true; // same shape as Client.mset()
   }
 
   // -------------------------------------------------------------------- atomic
@@ -187,7 +192,14 @@ class ShardedClient extends EventEmitter {
    */
   async subscribe(channel, handler, opts = {}) {
     if (!isPattern(channel)) return this._clientForChannel(channel).subscribe(channel, handler, opts);
-    const offs = await this._fanOut((c) => c.subscribe(channel, handler, opts));
+    const results = await Promise.allSettled(this.clients.map((c) => c.subscribe(channel, handler, opts)));
+    const offs = results.filter((r) => r.status === 'fulfilled').map((r) => r.value);
+    const failed = results.find((r) => r.status === 'rejected');
+    if (failed) {
+      // All-or-nothing: don't leave the pattern live on some shards with no handle to remove it.
+      await Promise.all(offs.map((off) => off().catch(() => {})));
+      throw failed.reason;
+    }
     return async () => {
       await Promise.all(offs.map((off) => off()));
     };
@@ -345,3 +357,4 @@ function aggregateStats(per) {
 }
 
 module.exports = ShardedClient;
+module.exports.resolveShardSpecs = resolveShardSpecs;

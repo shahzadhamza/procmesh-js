@@ -78,3 +78,20 @@ test("broker emits 'connect' and 'disconnect' with conn ids", async () => {
     broker.removeListener('disconnect', onDisconnect);
   }
 });
+
+test('close() is idempotent and SHUTDOWN is acknowledged before the broker goes away', async () => {
+  const b = await startBroker({ idleTimeout: 50 });
+  const c = await client(b);
+  assert.strictEqual(await c.shutdownBroker(), true, 'OK flushed before the socket closed');
+  const p1 = b.close();
+  assert.strictEqual(b.close(), p1, 'second close() returns the same promise');
+  await p1;
+  await c.close();
+});
+
+test('a broker nobody ever connects to still idles out', async () => {
+  const b = await startBroker({ idleTimeout: 50 });
+  await delay(150);
+  assert.ok(b._closePromise, 'idle shutdown fired without any connect/disconnect');
+  await b.close();
+});

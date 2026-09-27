@@ -26,17 +26,20 @@ class LockTimeout extends ProcMeshError {
   }
 }
 
-/** A fenced write was rejected: the caller's lock was superseded (stale fencing token). */
-class Fenced extends ProcMeshError {
-  constructor(message = 'fenced: stale lock token') {
-    super(message, 'EFENCED');
-  }
-}
-
 /** An error raised on the broker or a remote RPC handler, relayed to the caller. */
 class RemoteError extends ProcMeshError {
   constructor(message, code) {
     super(message, code || 'EREMOTE');
+  }
+}
+
+/**
+ * A fenced write was rejected: the caller's lock was superseded (stale fencing token). Raised by
+ * the broker, so it is also a RemoteError (code EFENCED).
+ */
+class Fenced extends RemoteError {
+  constructor(message = 'fenced: stale lock token') {
+    super(message, 'EFENCED');
   }
 }
 
